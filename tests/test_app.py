@@ -115,3 +115,54 @@ def test_hosts_error_response_includes_execution_logs(client, monkeypatch):
     assert response.json()["report"]["outcome"] == "failed"
     assert response.json()["report"]["logs"][-1]["level"] == "error"
     assert client.get("/api/operations").json()[0]["status"] == "failed"
+
+
+def test_subscription_api_selection_and_permissions(client, monkeypatch):
+    service = client.app.state.hosts
+    monkeypatch.setattr(
+        service,
+        "scan_subscription",
+        lambda: {
+            "entries": [
+                {
+                    "domain": "api.themoviedb.org",
+                    "ip": "1.1.1.1",
+                    "latency_ms": None,
+                    "source": "checktmdb",
+                    "retained": False,
+                }
+            ],
+            "failures": [],
+            "unresolved": [],
+            "partial": False,
+            "diagnostics": [],
+            "logs": [],
+            "source": "checktmdb",
+            "exports": {"ipv4": "", "ipv6": ""},
+        },
+    )
+    assert login(client, "viewer", "viewer-password-123").status_code == 200
+    preview = client.post(
+        "/api/hosts/update", json={"source": "checktmdb", "dry_run": True}, headers=HEADERS
+    )
+    assert preview.status_code == 200
+    assert preview.json()["source"] == "checktmdb"
+    assert (
+        client.post(
+            "/api/hosts/update", json={"source": "checktmdb", "dry_run": False}, headers=HEADERS
+        ).status_code
+        == 403
+    )
+    assert (
+        client.post(
+            "/api/hosts/update", json={"source": "https://example.com/hosts"}, headers=HEADERS
+        ).status_code
+        == 422
+    )
+    assert login(client).status_code == 200
+    updated = client.post(
+        "/api/hosts/update", json={"source": "checktmdb", "dry_run": False}, headers=HEADERS
+    )
+    assert updated.status_code == 200
+    assert updated.json()["changed"] is True
+    assert client.get("/api/config").json()["hosts_source"] == "dns"

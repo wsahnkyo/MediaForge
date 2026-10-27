@@ -1,10 +1,18 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 
+type HostsSource = "dns" | "checktmdb";
+const sourceNames: Record<HostsSource, string> = {
+  dns: "本机 DNS 查询 + TLS 测速",
+  checktmdb: "CheckTMDB 订阅（IPv4 + IPv6）",
+};
+
 interface Config {
   roots: { id: number; path: string }[];
   hosts_path: string;
   hosts_interval_seconds: number;
+  hosts_source: HostsSource;
+  hosts_subscription_urls: { A: string; AAAA: string };
   dns_servers: string[];
   dns_providers: string[];
   hosts_domains: string[];
@@ -41,6 +49,7 @@ interface FilePlan {
 interface HostEntry { domain: string; ip: string; latency_ms: number | null; source: string; retained: boolean }
 interface RunLog { time: string; level: string; domain: string; message: string }
 interface HostReport {
+  source: HostsSource;
   entries: HostEntry[];
   failures: string[];
   diagnostics: { domain: string; warnings: string[] }[];
@@ -100,6 +109,7 @@ const deleteName = ref("");
 const plan = ref<FilePlan | null>(null);
 const plannedRequest = ref<FileRequest | null>(null);
 const hostReport = ref<HostReport | null>(null);
+const hostSource = ref<HostsSource>("dns");
 const records = ref<Operation[]>([]);
 const busy = ref(false);
 const error = ref("");
@@ -174,6 +184,7 @@ async function enter(path: string) { directory.value = path; await loadFiles(); 
 
 async function loadWorkspace() {
   config.value = await api<Config>("/config");
+  hostSource.value = config.value.hosts_source;
   root.value = config.value.roots[0]?.id ?? 0;
   destinationRoot.value = root.value;
   directory.value = "";
@@ -256,7 +267,9 @@ async function hosts(dryRun: boolean) {
     hostRunError.value = "";
     hostReport.value = null;
     try {
-      hostReport.value = await api<HostReport>("/hosts/update", { dry_run: dryRun });
+      hostReport.value = await api<HostReport>("/hosts/update", {
+        dry_run: dryRun, source: hostSource.value,
+      });
       if (hostReport.value.outcome === "failed") throw new Error(hostReport.value.blocked_reason);
       noticeTone.value = hostReport.value.outcome === "partial" ? "warning" : "success";
       notice.value = `执行${outcomeNames[hostReport.value.outcome]}。` + (dryRun ? "未写入 hosts 文件。"
@@ -431,7 +444,7 @@ async function changePassword() {
         </div>
         <section class="panel"><h2>工作模块</h2><div class="module-grid">
           <button @click="tab = 'files'"><b>文件管理</b><span>浏览、重命名、移动、永久删除</span></button>
-          <button @click="tab = 'hosts'"><b>Hosts 管理</b><span>DNS 查询、TLS 测速、托管区更新</span></button>
+          <button @click="tab = 'hosts'"><b>Hosts 管理</b><span>DNS 测速、CheckTMDB 订阅、托管区更新</span></button>
           <button @click="tab = 'downloads'"><b>影视下载</b><span>模块边界预留，尚未接入下载器</span></button>
           <button @click="tab = 'metadata'"><b>元数据刮削</b><span>模块边界预留，尚未接入刮削器</span></button>
         </div></section>
@@ -487,38 +500,57 @@ async function changePassword() {
         </template>
       </section>
       <section v-if="tab === 'hosts'" class="panel">
-        <h2>多源 DNS 查询与 TLS 测速</h2>
-        <p>优先使用 HTTPS DNS，查询失败或地址不可用时切换来源。使用本机 TCP + TLS 握手耗时选优，并校验证书与域名；不会使用未经验证的新 IP。</p>
-        <dl><dt>目标文件</dt><dd><code>{{ config.hosts_path }}</code></dd>
-          <dt>查询源顺序</dt><dd>{{ config.dns_providers.join(" → ") }}</dd>
-          <dt>普通 DNS / 地址族</dt><dd>{{ config.dns_servers.join(", ") }} / {{ config.ip_family }}</dd>
-          <dt>域名范围</dt><dd>{{ config.hosts_domains.length }} 个；GitHub {{ config.hosts_include_github ? "已开启" : "已关闭" }}</dd>
-          <dt>定时更新</dt><dd>{{ config.hosts_interval_seconds ? config.hosts_interval_seconds + " 秒一次" : "已关闭（修改 .env 后重启可开启）" }}</dd></dl>
+        <h2>Hosts 数据获取</h2>
         <div class="toolbar">
-          <button :disabled="busy" @click="hosts(true)">查询并预览（不写入）</button>
-          <button v-if="isAdmin" :disabled="busy" @click="hosts(false)">重新查询并更新文件</button>
+          <label for="hosts-source">本次获取方式</label>
+          <select id="hosts-source" v-model="hostSource" :disabled="busy">
+            <option value="dns">{{ sourceNames.dns }}</option>
+            <option value="checktmdb">{{ sourceNames.checktmdb }}</option>
+          </select>
+          <small>仅影响本次手动执行，不修改定时任务配置。</small>
+        </div>
+        <p v-if="hostSource === 'dns'">优先使用 HTTPS DNS，查询失败或地址不可用时切换来源。使用本机 TCP + TLS 握手耗时选优，并校验证书与域名。</p>
+        <template v-else>
+          <p>同时下载两个订阅文件，校验 HTTPS 证书、公开 IP、地址族和允许的域名，不再做本机 TLS 测速。订阅映射在当前网络是否可用尚未验证。</p>
+          <p><a :href="config.hosts_subscription_urls.A" target="_blank" rel="noopener noreferrer">IPv4 订阅文件</a> · <a :href="config.hosts_subscription_urls.AAAA" target="_blank" rel="noopener noreferrer">IPv6 订阅文件</a></p>
+          <p>上游未包含的配置域名（包括 GitHub）仅保留已有托管映射，不额外发起 DNS 查询。任一订阅失败时保留该地址族旧映射，两个都失败则不写入。</p>
+        </template>
+        <dl><dt>目标文件</dt><dd><code>{{ config.hosts_path }}</code></dd>
+          <template v-if="hostSource === 'dns'">
+            <dt>查询源顺序</dt><dd>{{ config.dns_providers.join(" → ") }}</dd>
+            <dt>普通 DNS / 地址族</dt><dd>{{ config.dns_servers.join(", ") }} / {{ config.ip_family }}</dd>
+          </template>
+          <dt>域名范围</dt><dd>{{ config.hosts_domains.length }} 个；GitHub {{ config.hosts_include_github ? "已开启" : "已关闭" }}</dd>
+          <dt>自动获取方式</dt><dd>{{ sourceNames[config.hosts_source] }}</dd>
+          <dt>定时更新</dt><dd>{{ config.hosts_interval_seconds ? config.hosts_interval_seconds + " 秒一次" : "已关闭（修改 .env 后重启可开启）" }}</dd></dl>
+        <details><summary>如何开启自动订阅</summary><p>在 .env 设置以下两项后重启服务。定时执行会更新上述目标文件，首次建议保持预览文件路径。</p><pre>MEDIAFORGE_HOSTS_SOURCE=checktmdb
+MEDIAFORGE_HOSTS_INTERVAL_SECONDS=3600</pre></details>
+        <div class="toolbar">
+          <button :disabled="busy" @click="hosts(true)">获取并预览（不写入）</button>
+          <button v-if="isAdmin" :disabled="busy" @click="hosts(false)">重新获取并更新文件</button>
           <button @click="tab = 'logs'">追踪实时运行日志</button>
         </div>
         <p>首次建议保留 hosts.preview 目标。系统 hosts 需显式开启权限并以管理员身份运行；只替换 MediaForge 托管区，其他内容保持不变。</p>
-        <p v-if="hostRunning" role="status">正在执行 DNS 查询和测速… 可切换“运行日志”查看最新进展。</p>
+        <p v-if="hostRunning" role="status">正在执行{{ sourceNames[hostSource] }}… 可切换“运行日志”查看最新进展。</p>
         <p v-if="hostRunError" class="message error" role="alert">执行失败：{{ hostRunError }}</p>
         <template v-if="hostReport">
           <h3>执行结果：<span :class="{ danger: hostReport.outcome === 'failed', warning: hostReport.outcome === 'partial' }">{{ outcomeNames[hostReport.outcome] }}</span></h3>
+          <p>本次来源：{{ sourceNames[hostReport.source] }}</p>
           <p v-if="hostReport.unresolved.length" class="warning">未获取可用新映射：{{ hostReport.unresolved.map(item => `${item.domain} (${item.record_type})`).join("、") }}。仅保留已有托管映射，不代表旧 IP 仍可用。</p>
           <p v-if="!hostReport.can_apply" class="danger">{{ hostReport.blocked_reason }}</p>
           <p v-if="hostReport.backup">备份：<code>{{ hostReport.backup }}</code></p>
           <div class="table-wrap"><table><thead><tr><th>域名</th><th>IP</th><th>来源 / 状态</th><th>TLS 延迟</th></tr></thead>
             <tbody><tr v-for="entry in hostReport.entries" :key="entry.domain + entry.ip">
-              <td>{{ entry.domain }}</td><td><code>{{ entry.ip }}</code></td><td :class="{ warning: entry.retained }">{{ entry.retained ? "保留旧映射（未验证）" : entry.source }}</td><td>{{ entry.latency_ms === null ? "—" : entry.latency_ms + " ms" }}</td>
+              <td>{{ entry.domain }}</td><td><code>{{ entry.ip }}</code></td><td :class="{ warning: entry.retained }">{{ entry.retained ? "保留旧映射（未验证）" : entry.source === "checktmdb" ? "CheckTMDB 订阅（未做本机测速）" : entry.source }}</td><td>{{ entry.latency_ms === null ? "—" : entry.latency_ms + " ms" }}</td>
             </tr></tbody></table></div>
           <div class="toolbar">
             <button :disabled="!hostReport.exports.ipv4" @click="exportHosts('ipv4')">导出本轮 IPv4</button>
             <button :disabled="!hostReport.exports.ipv6" @click="exportHosts('ipv6')">导出本轮 IPv6</button>
-            <small>仅包含本轮通过 TLS 校验的地址，不导出未验证的旧映射。</small>
+            <small>仅导出本轮获取的数据，不包含保留的旧映射；订阅数据未在本机测速。</small>
           </div>
           <h3>本次执行日志</h3>
           <div class="run-log" role="log"><div v-for="(line, index) in hostReport.logs" :key="index" :class="'log-' + line.level"><time>{{ new Date(line.time).toLocaleTimeString() }}</time> [{{ line.level }}] {{ line.domain ? `[${line.domain}] ` : "" }}{{ line.message }}</div></div>
-          <details><summary>DNS / 测速诊断</summary><pre>{{ JSON.stringify(hostReport.diagnostics, null, 2) }}</pre></details>
+          <details><summary>获取 / 测速诊断</summary><pre>{{ JSON.stringify(hostReport.diagnostics, null, 2) }}</pre></details>
         </template>
       </section>
       <section v-if="tab === 'logs'" class="panel">
@@ -575,6 +607,7 @@ async function changePassword() {
           <dt>前端</dt><dd>Vue 3 构建产物，由 Python 提供；运行时无需 Node</dd>
           <dt>媒体目录</dt><dd>{{ config.roots.map(item => item.path).join("、") || "未配置" }}</dd>
           <dt>Hosts 目标</dt><dd>{{ config.hosts_path }}</dd>
+          <dt>Hosts 默认来源</dt><dd>{{ sourceNames[config.hosts_source] }}</dd>
           <dt>DNS 查询源</dt><dd>{{ config.dns_providers.join(" → ") }}</dd>
           <dt>日志文件</dt><dd>{{ config.log_path }}</dd>
           <dt>日志保留</dt><dd>{{ config.log_retention_days }} 天 / 总量 {{ config.log_max_total_mb }} MiB / 单文件 {{ config.log_max_file_mb }} MiB</dd></dl>

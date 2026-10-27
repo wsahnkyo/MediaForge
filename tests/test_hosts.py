@@ -9,7 +9,7 @@ import httpx
 import pytest
 
 from mediaforge.database import OperationFailure
-from mediaforge.hosts import BEGIN, END, HostsService, merge_hosts
+from mediaforge.hosts import BEGIN, CHECKTMDB_URLS, END, HostsService, merge_hosts
 
 
 def report_for(entries, unresolved=()):
@@ -25,8 +25,11 @@ def report_for(entries, unresolved=()):
 
 
 def mock_http(monkeypatch, handler):
-    client = httpx.Client(transport=httpx.MockTransport(handler))
-    monkeypatch.setattr("mediaforge.hosts.httpx.Client", lambda **kwargs: client)
+    client_type = httpx.Client
+    monkeypatch.setattr(
+        "mediaforge.hosts.httpx.Client",
+        lambda **kwargs: client_type(transport=httpx.MockTransport(handler)),
+    )
 
 
 def test_merge_is_idempotent_and_preserves_unmanaged_bytes():
@@ -314,3 +317,122 @@ def test_enabled_github_domains_use_same_validation_pipeline(settings, store, mo
     assert "raw.githubusercontent.com" in probed
     assert probed.count("github.com") == 1
     assert len(result["entries"]) == len(probed)
+
+
+def test_subscription_gets_both_families_filters_and_never_probes(settings, store, monkeypatch):
+    settings.hosts_domains = ["api.themoviedb.org", "image.tmdb.org"]
+    service = HostsService(settings, store)
+    original = b"127.0.0.1 localhost\r\n"
+    settings.hosts_path.write_bytes(original)
+    requested = []
+
+    def handler(request):
+        requested.append(str(request.url))
+        if str(request.url) == CHECKTMDB_URLS["A"]:
+            text = (
+                "\ufeff# Tmdb Hosts Start\n"
+                "1.1.1.1 api.themoviedb.org image.tmdb.org # two aliases\n"
+                "1.1.1.1 api.themoviedb.org\n"
+                "8.8.8.8 unrelated.example.com\n# Tmdb Hosts End\n"
+            )
+        else:
+            text = "2606:4700:4700::1111 api.themoviedb.org image.tmdb.org\n"
+        return httpx.Response(200, text=text)
+
+    mock_http(monkeypatch, handler)
+    monkeypatch.setattr(service, "_probe", lambda *args: pytest.fail("订阅不应测速"))
+    monkeypatch.setattr(service, "_resolve", lambda *args: pytest.fail("订阅不应查询 DNS"))
+    preview = service.update(source="checktmdb")
+    assert requested == list(CHECKTMDB_URLS.values())
+    assert preview["outcome"] == "success"
+    assert len(preview["entries"]) == 4
+    assert all(item["latency_ms"] is None for item in preview["entries"])
+    assert "NOT locally probed" in preview["exports"]["ipv4"]
+    assert "unrelated.example.com" not in preview["exports"]["ipv4"]
+    assert any("忽略" in item["message"] for item in preview["logs"])
+    assert settings.hosts_path.read_bytes() == original
+    result = service.update(False, source="checktmdb")
+    assert Path(result["backup"]).read_bytes() == original
+    assert settings.hosts_path.read_bytes().startswith(original)
+    assert b"2606:4700:4700::1111" in settings.hosts_path.read_bytes()
+    assert settings.hosts_source == "dns"
+    assert store.recent()[0]["request"]["source"] == "checktmdb"
+
+
+def test_subscription_failure_preserves_family_and_absent_github(settings, store, monkeypatch):
+    settings.hosts_include_github = True
+    service = HostsService(settings, store)
+    original = merge_hosts(
+        b"127.0.0.1 localhost\n",
+        [
+            {"domain": "api.themoviedb.org", "ip": "8.8.8.8"},
+            {"domain": "api.themoviedb.org", "ip": "2606:4700:4700::1111"},
+            {"domain": "github.com", "ip": "140.82.112.3"},
+        ],
+        service.domains,
+    )
+    settings.hosts_path.write_bytes(original)
+
+    def handler(request):
+        if str(request.url) == CHECKTMDB_URLS["AAAA"]:
+            return httpx.Response(403)
+        return httpx.Response(200, text="1.1.1.1 api.themoviedb.org\n")
+
+    mock_http(monkeypatch, handler)
+    result = service.update(False, source="checktmdb")
+    assert result["outcome"] == "partial"
+    content = settings.hosts_path.read_bytes()
+    assert b"1.1.1.1\tapi.themoviedb.org" in content
+    assert b"2606:4700:4700::1111\tapi.themoviedb.org" in content
+    assert b"140.82.112.3\tgithub.com" in content
+    assert store.recent()[0]["status"] == "partial"
+    assert any("403" in item["message"] for item in result["logs"])
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b"<html>not a hosts file</html>",
+        b"127.0.0.1 api.themoviedb.org\n",
+        b"2606:4700:4700::1111 api.themoviedb.org\n",
+        b"1.1.1.1 invalid/domain\n",
+        b"1.1.1.1 unrelated.example.com\n",
+        b"# empty subscription\n",
+        b"\xff\xfe",
+    ],
+)
+def test_bad_subscription_never_replaces_existing_file(settings, store, monkeypatch, content):
+    original = b"127.0.0.1 localhost\n"
+    settings.hosts_path.write_bytes(original)
+    service = HostsService(settings, store)
+
+    def handler(request):
+        return httpx.Response(
+            200, content=content if str(request.url) == CHECKTMDB_URLS["A"] else b"invalid"
+        )
+
+    mock_http(monkeypatch, handler)
+    with pytest.raises(OperationFailure):
+        service.update(False, source="checktmdb")
+    assert settings.hosts_path.read_bytes() == original
+    assert store.recent()[0]["status"] == "failed"
+    assert store.recent()[0]["result"]["source"] == "checktmdb"
+
+
+def test_subscription_size_limit_and_scheduled_source(settings, store, monkeypatch):
+    settings.hosts_source = "checktmdb"
+    service = HostsService(settings, store)
+
+    def handler(request):
+        if str(request.url) == CHECKTMDB_URLS["A"]:
+            return httpx.Response(200, content=b"#" * (1024 * 1024 + 1))
+        return httpx.Response(200, text="2606:4700:4700::1111 api.themoviedb.org\n")
+
+    mock_http(monkeypatch, handler)
+    service.scheduled_update()
+    record = store.recent()[0]
+    assert record["kind"] == "hosts.update"
+    assert record["request"]["source"] == "checktmdb"
+    assert record["status"] == "partial"
+    assert b"2606:4700:4700::1111" in settings.hosts_path.read_bytes()
+    assert any("1 MiB" in item["message"] for item in record["result"]["logs"])

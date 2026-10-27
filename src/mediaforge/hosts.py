@@ -18,7 +18,7 @@ import dns.exception
 import dns.resolver
 import httpx
 
-from mediaforge.config import Settings, system_hosts_path
+from mediaforge.config import DOMAIN_PATTERN, HostsSource, Settings, system_hosts_path
 from mediaforge.database import OperationFailure, OperationStore
 from mediaforge.files import is_link
 
@@ -29,6 +29,10 @@ DOH_URLS = {
     "google": "https://dns.google/resolve",
     "cloudflare": "https://cloudflare-dns.com/dns-query",
     "alidns": "https://dns.alidns.com/resolve",
+}
+CHECKTMDB_URLS = {
+    "A": "https://raw.githubusercontent.com/cnwikee/CheckTMDB/refs/heads/main/Tmdb_host_ipv4",
+    "AAAA": "https://raw.githubusercontent.com/cnwikee/CheckTMDB/refs/heads/main/Tmdb_host_ipv6",
 }
 GITHUB_DOMAINS = (
     "github.com",
@@ -133,9 +137,9 @@ class HostsService:
             else ["A" if self.settings.ip_family == "ipv4" else "AAAA"]
         )
 
-    def _json(
+    def _download(
         self, client: httpx.Client, url: str, params: dict[str, str], headers: dict[str, str]
-    ) -> dict[str, Any]:
+    ) -> bytes:
         for attempt in range(self.settings.dns_attempts):
             try:
                 with client.stream("GET", url, params=params, headers=headers) as response:
@@ -144,11 +148,8 @@ class HostsService:
                     for chunk in response.iter_bytes():
                         content.extend(chunk)
                         if len(content) > 1024 * 1024:
-                            raise ValueError("DNS 响应超过 1 MiB")
-                data = json.loads(content)
-                if not isinstance(data, dict):
-                    raise ValueError("DNS 响应不是 JSON 对象")
-                return data
+                            raise ValueError("HTTPS 响应超过 1 MiB")
+                return bytes(content)
             except (httpx.TransportError, httpx.HTTPStatusError) as exc:
                 retryable = (
                     not isinstance(exc, httpx.HTTPStatusError)
@@ -157,9 +158,17 @@ class HostsService:
                 )
                 if not retryable or attempt + 1 == self.settings.dns_attempts:
                     raise
-                logger.warning("HTTPS DNS 请求失败，重试 %s: %s", attempt + 1, type(exc).__name__)
+                logger.warning("HTTPS 请求失败，重试 %s: %s", attempt + 1, type(exc).__name__)
                 time.sleep(0.2 * (attempt + 1))
-        raise RuntimeError("DNS 重试次数配置无效")
+        raise RuntimeError("HTTPS 重试次数配置无效")
+
+    def _json(
+        self, client: httpx.Client, url: str, params: dict[str, str], headers: dict[str, str]
+    ) -> dict[str, Any]:
+        data = json.loads(self._download(client, url, params, headers))
+        if not isinstance(data, dict):
+            raise ValueError("DNS 响应不是 JSON 对象")
+        return data
 
     def _resolve(
         self, provider: str, domain: str, record_type: str, client: httpx.Client
@@ -292,14 +301,27 @@ class HostsService:
                 key=lambda item: item["time"],
             )
         )
+        return self._scan_report(entries, unresolved, results, logs, source="dns")
+
+    def _scan_report(
+        self,
+        entries: list[dict[str, Any]],
+        unresolved: list[dict[str, str]],
+        diagnostics: list[dict[str, Any]],
+        logs: list[dict[str, str]],
+        source: HostsSource,
+    ) -> dict[str, Any]:
         timestamp = datetime.now(UTC).isoformat()
+        validation = (
+            "TLS verified" if source == "dns" else "Subscription format checked; NOT locally probed"
+        )
         exports = {}
         for family in ("ipv4", "ipv6"):
             selected = [entry for entry in entries if (":" in entry["ip"]) == (family == "ipv6")]
             exports[family] = (
                 (
-                    f"# MediaForge {family} - TLS verified at {timestamp}\n"
-                    "# Only addresses verified in this scan; retained old mappings are excluded.\n"
+                    f"# MediaForge {family} - {validation} at {timestamp}\n"
+                    "# Only newly obtained addresses; retained old mappings are excluded.\n"
                     + "".join(f"{entry['ip']}\t{entry['domain']}\n" for entry in selected)
                 )
                 if selected
@@ -307,13 +329,118 @@ class HostsService:
             )
         return {
             "entries": entries,
-            "failures": [result["domain"] for result in results if not result["entries"]],
+            "failures": sorted(
+                {item["domain"] for item in unresolved} - {item["domain"] for item in entries}
+            ),
             "unresolved": unresolved,
             "partial": bool(unresolved),
-            "diagnostics": results,
+            "diagnostics": diagnostics,
             "target": str(self.settings.hosts_path),
             "exports": exports,
             "logs": logs,
+            "source": source,
+        }
+
+    def _parse_subscription(
+        self, content: bytes, version: int
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        entries = []
+        seen = set()
+        ignored = set()
+        allowed = set(self.domains)
+        for number, line in enumerate(content.decode("utf-8-sig").splitlines(), start=1):
+            fields = line.split("#", 1)[0].split()
+            if not fields:
+                continue
+            if len(fields) < 2:
+                raise ValueError(f"订阅第 {number} 行缺少 IP 或域名")
+            try:
+                address = str(public_address(fields[0], version))
+            except ValueError as exc:
+                raise ValueError(f"订阅第 {number} 行: {exc}") from exc
+            for value in fields[1:]:
+                domain = value.lower().rstrip(".")
+                if not DOMAIN_PATTERN.fullmatch(domain):
+                    raise ValueError(f"订阅第 {number} 行包含无效域名")
+                if domain not in allowed:
+                    ignored.add(domain)
+                    continue
+                if (domain, address) not in seen:
+                    seen.add((domain, address))
+                    entries.append(
+                        {
+                            "domain": domain,
+                            "ip": address,
+                            "latency_ms": None,
+                            "source": "checktmdb",
+                            "retained": False,
+                        }
+                    )
+        if not entries:
+            raise ValueError("订阅未包含允许域名的有效映射，拒绝替换旧数据")
+        return entries, sorted(ignored)
+
+    def scan_subscription(self) -> dict[str, Any]:
+        logs: list[dict[str, str]] = []
+        entries: list[dict[str, Any]] = []
+        unresolved: list[dict[str, str]] = []
+        preserve: list[dict[str, str]] = []
+        diagnostics: list[dict[str, Any]] = []
+        add_log(logs, "info", "开始获取 CheckTMDB IPv4/IPv6 订阅；仅校验格式，不做本机测速")
+        with httpx.Client(
+            timeout=self.settings.network_timeout,
+            verify=self.tls_context,
+            follow_redirects=False,
+        ) as client:
+            for record_type, url in CHECKTMDB_URLS.items():
+                warnings = []
+                selected = []
+                add_log(logs, "info", f"正在获取 {record_type} 订阅: {url}")
+                try:
+                    content = self._download(client, url, {}, {"accept": "text/plain"})
+                    selected, ignored = self._parse_subscription(
+                        content, 4 if record_type == "A" else 6
+                    )
+                    entries.extend(selected)
+                    if ignored:
+                        warning = "忽略不在允许列表中的域名: " + ", ".join(ignored)
+                        warnings.append(warning)
+                        add_log(logs, "warning", warning)
+                    provided = {item["domain"] for item in selected}
+                    missing = set(self.domains) - provided
+                    preserve.extend(
+                        {"domain": domain, "record_type": record_type} for domain in sorted(missing)
+                    )
+                    add_log(
+                        logs,
+                        "success",
+                        f"{record_type} 订阅获取成功，共 {len(selected)} 条映射；未做本机测速",
+                    )
+                    if missing:
+                        add_log(
+                            logs,
+                            "info",
+                            f"{record_type} 订阅未覆盖 {len(missing)} 个配置域名，"
+                            "保留其旧映射（如有）",
+                        )
+                except (httpx.HTTPError, ValueError) as exc:
+                    warning = f"{record_type} 订阅获取失败: {exc}"
+                    warnings.append(warning)
+                    add_log(logs, "error", warning)
+                    unresolved.extend(
+                        {"domain": domain, "record_type": record_type} for domain in self.domains
+                    )
+                diagnostics.append(
+                    {
+                        "domain": url,
+                        "entries": selected,
+                        "warnings": warnings,
+                        "record_type": record_type,
+                    }
+                )
+        return {
+            **self._scan_report(entries, unresolved, diagnostics, logs, source="checktmdb"),
+            "preserve": preserve,
         }
 
     def _read_target(self) -> bytes:
@@ -330,7 +457,8 @@ class HostsService:
 
     def _prepare(self, scan: dict[str, Any], original: bytes) -> dict[str, Any]:
         unresolved = {
-            (item["domain"], 4 if item["record_type"] == "A" else 6) for item in scan["unresolved"]
+            (item["domain"], 4 if item["record_type"] == "A" else 6)
+            for item in [*scan["unresolved"], *scan.get("preserve", [])]
         }
         retained = []
         bounds = managed_bounds(original)
@@ -362,7 +490,7 @@ class HostsService:
             "can_apply": bool(scan["entries"]),
             "blocked_reason": ""
             if scan["entries"]
-            else "本轮没有通过 TLS 校验的新映射，保留原文件",
+            else "本轮没有通过所选方式校验的新映射，保留原文件",
             "outcome": (
                 "failed" if not scan["entries"] else "partial" if scan["partial"] else "success"
             ),
@@ -410,7 +538,8 @@ class HostsService:
             temporary_path.unlink(missing_ok=True)
         return {**report, "changed": True, "backup": str(backup) if backup else None}
 
-    def update(self, dry_run: bool = True) -> dict[str, Any]:
+    def update(self, dry_run: bool = True, source: HostsSource | None = None) -> dict[str, Any]:
+        selected_source = source or self.settings.hosts_source
         with self.lock:
 
             def apply() -> dict[str, Any]:
@@ -422,10 +551,13 @@ class HostsService:
                     "exports": {"ipv4": "", "ipv6": ""},
                     "logs": [],
                     "target": str(self.settings.hosts_path),
+                    "source": selected_source,
                 }
                 try:
                     original = self._read_target()
-                    scan = self.scan()
+                    scan = (
+                        self.scan_subscription() if selected_source == "checktmdb" else self.scan()
+                    )
                     if dry_run:
                         report = self._prepare(scan, original)
                         merge_hosts(
@@ -468,7 +600,11 @@ class HostsService:
 
             return self.store.execute(
                 "hosts.preview" if dry_run else "hosts.update",
-                {"target": str(self.settings.hosts_path), "dry_run": dry_run},
+                {
+                    "target": str(self.settings.hosts_path),
+                    "dry_run": dry_run,
+                    "source": selected_source,
+                },
                 apply,
             )
 

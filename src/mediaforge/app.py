@@ -21,7 +21,7 @@ from mediaforge.auth import (
     UserCreate,
     UserUpdate,
 )
-from mediaforge.config import Settings
+from mediaforge.config import HostsSource, Settings
 from mediaforge.database import (
     OperationFailure,
     OperationStore,
@@ -30,7 +30,7 @@ from mediaforge.database import (
     operation_actor,
 )
 from mediaforge.files import FileAction, FileService
-from mediaforge.hosts import HostsService
+from mediaforge.hosts import CHECKTMDB_URLS, HostsService
 from mediaforge.logs import LogService
 
 logger = logging.getLogger(__name__)
@@ -39,6 +39,7 @@ WEB = Path(__file__).with_name("web")
 
 class HostsUpdate(BaseModel):
     dry_run: bool = True
+    source: HostsSource | None = None
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -233,6 +234,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "roots": [{"id": i, "path": str(root)} for i, root in enumerate(settings.media_roots)],
             "hosts_path": str(settings.hosts_path),
             "hosts_interval_seconds": settings.hosts_interval_seconds,
+            "hosts_source": settings.hosts_source,
+            "hosts_subscription_urls": CHECKTMDB_URLS,
             "dns_servers": settings.dns_servers,
             "dns_providers": settings.dns_providers,
             "hosts_domains": hosts.domains,
@@ -256,7 +259,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def update_hosts(body: HostsUpdate, user: Annotated[dict, Depends(current_user)]):
         if not body.dry_run and user["role"] != "admin":
             raise HTTPException(403, "更新 hosts 需要管理员权限")
-        return hosts.update(body.dry_run)
+        return hosts.update(body.dry_run, body.source)
 
     @app.get("/api/operations", dependencies=secured)
     def operations():

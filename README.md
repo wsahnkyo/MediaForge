@@ -106,15 +106,18 @@ SQLite **仅用于离线单元测试**，应用运行不支持 SQLite。
 ## Hosts 动态更新
 
 参考 [CheckTMDB](https://github.com/cnwikee/CheckTMDB)，迁入对本机更新有效的能力：
-完整媒体域名清单（去重）、Google DoH、IPv4/IPv6 结果导出及 GitHub 域名支持。
+完整媒体域名清单（去重）、Google DoH、IPv4/IPv6 结果导出及 GitHub 域名支持，
+另支持直接获取 CheckTMDB 的 IPv4/IPv6 订阅。
 没有迁入自动修改 README、GitHub Actions 提交推送，以及“测速全部失败仍选择首个 IP”的不安全回退。
+
+### 本机 DNS 与 TLS 检测（默认）
 
 1. 默认按 Google DoH → Cloudflare DoH → AliDNS DoH → 普通 DNS 的顺序查询 A/AAAA。
    每个地址族在查询失败、无记录或候选 IP 全部连接失败时切换来源；某一来源有可用 IP 后停止切换。
    HTTP 瞬时错误最多尝试 2 次，明确的 4xx（429 除外）不重复请求。
 2. 拒绝非公网、特殊用途及错误地址族的候选，对 IP 的 443 端口执行 TLS 握手，并校验域名与证书。
    每个来源最多测 8 个去重候选，选取其中握手耗时最低的地址；并非扫描所有来源选全局最快 IP。
-3. 不关闭证书校验、不照抄远程 hosts 文件。TLS 测速不等于验证具体业务 API，
+3. 不关闭证书校验；本机检测模式不直接使用远程 hosts 文件。TLS 测速不等于验证具体业务 API，
    HTTPS 查询也不保证能绕过当前网络的连接限制。
 4. 更新本轮成功映射；失败的“域名 + 地址族”保留原托管区旧映射（如有），标记“未验证”并告警。
    `both` 下 A 成功、AAAA 失败时仅替换 A，保留已有 AAAA。没有任何新地址通过校验则完全不写入。
@@ -127,6 +130,7 @@ SQLite **仅用于离线单元测试**，应用运行不支持 SQLite。
 配置示例：
 
 ```dotenv
+MEDIAFORGE_HOSTS_SOURCE=dns
 MEDIAFORGE_DNS_SERVERS=["1.1.1.1","8.8.8.8"]
 MEDIAFORGE_DNS_PROVIDERS=["google","cloudflare","alidns","dns"]
 MEDIAFORGE_DNS_ATTEMPTS=2
@@ -138,22 +142,53 @@ MEDIAFORGE_NETWORK_TIMEOUT=3
 MEDIAFORGE_PROBE_WORKERS=8
 ```
 
-`IP_FAMILY` 可设为 `ipv4`、`ipv6`、`both`。更新间隔为 `0` 时关闭定时任务，否则最少
+本机检测的 `IP_FAMILY` 可设为 `ipv4`、`ipv6`、`both`。更新间隔为 `0` 时关闭定时任务，否则最少
 60 秒。服务存活时才会定时执行，启动后等待一个周期执行首次更新；不要启动多个 worker。
 
 `HOSTS_DOMAINS` 不配置时使用 CheckTMDB 的完整去重媒体域名清单；设置后会替换该清单。
 GitHub 常用域名默认额外加入，包括 `github.com`、`api.github.com`、`raw.githubusercontent.com`、
-源码与发行包下载域名。它们同样经过 DNS 查询和 TLS 校验，**不是代理**，只帮助处理解析问题。
+源码与发行包下载域名。在本机检测模式下，它们同样经过 DNS 查询和 TLS 校验，
+**不是代理**，只帮助处理解析问题。
 如不需要，设置 `MEDIAFORGE_HOSTS_INCLUDE_GITHUB=false`。
 
 参考项目的 DNSChecker 网页接口在本次实际请求中返回 HTTP 404，未作为可用查询源迁入。
 公共 DoH 服务也可能被当前网络限制；页面会保留各来源的超时、HTTP 状态和 TLS 失败原因，
 不以跳过证书校验或选取未验证 IP 的方式伪装成功。
 
-每次预览/更新都保存 PostgreSQL 操作记录，并在页面显示**成功、部分成功或失败**、查询来源、
-TLS 延迟及失败原因。运行中的细节可在“运行日志”页面追踪，完成后在 Hosts 页面展示本次完整结果。
-预览不会修改 hosts，但会写入执行日志。页面可分别下载本轮验证通过的 IPv4/IPv6 文本；
-不导出未验证的旧映射，不在项目目录中自动生成多余文件。
+### CheckTMDB 订阅
+
+在 Hosts 页面选择 **CheckTMDB 订阅**，可手动获取并预览或更新。每次都获取以下两个固定地址，
+不受本机检测的 `IP_FAMILY` 设置影响：
+
+- IPv4：<https://raw.githubusercontent.com/cnwikee/CheckTMDB/refs/heads/main/Tmdb_host_ipv4>
+- IPv6：<https://raw.githubusercontent.com/cnwikee/CheckTMDB/refs/heads/main/Tmdb_host_ipv6>
+
+下载仍校验 HTTPS 证书，并限制响应为 1 MiB。内容只接受有效公网 IP、对应地址族及合法域名，
+仅导入 `HOSTS_DOMAINS` 和已启用 GitHub 域名允许列表中的映射。
+**订阅模式不执行本机 DNS 查询或 TLS 测速**，因此格式有效不代表地址在当前网络可访问；
+页面和导出文件会明确标记未做本机测速。
+
+两个文件独立处理：一个失败时仍可更新另一个，失败地址族的旧映射保留并告警；
+都没有有效新映射时不写入。有效订阅未覆盖的配置域名同样保留旧映射（如有），
+包括订阅未提供的 GitHub 域名，不额外查询 DNS。写入沿用托管区、冲突检查和备份机制。
+
+自动订阅需在 `.env` 中设置并重启服务：
+
+```dotenv
+MEDIAFORGE_HOSTS_SOURCE=checktmdb
+MEDIAFORGE_HOSTS_INTERVAL_SECONDS=3600
+```
+
+默认来源仍为 `dns`，自动更新默认关闭。页面手动选择只影响本次执行，
+不会改变 `.env` 中定时任务的来源。
+
+### 执行结果与系统 hosts
+
+每次预览/更新都保存 PostgreSQL 操作记录，并在页面显示**成功、部分成功或失败**、获取来源、
+本机检测的 TLS 延迟或订阅未测速提示及失败原因。运行中的细节可在“运行日志”页面追踪，
+完成后在 Hosts 页面展示本次完整结果。预览不会修改 hosts，但会写入执行日志。
+页面可分别下载本轮按所选方式校验的 IPv4/IPv6 文本；不导出保留的旧映射，
+不在项目目录中自动生成多余文件。
 
 先对 `hosts.preview` 预览与更新。确需修改 Windows 系统 hosts 时，使用管理员 PowerShell，
 并显式设置：

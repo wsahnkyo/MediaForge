@@ -10,6 +10,7 @@ DOMAIN_PATTERN = re.compile(
     r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
     r"[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?"
 )
+HostsSource = Literal["dns", "checktmdb"]
 
 
 def system_hosts_path() -> Path:
@@ -28,6 +29,7 @@ class Settings(BaseSettings):
     hosts_path: Path = Path("data/hosts.preview")
     hosts_allow_system: bool = False
     hosts_interval_seconds: int = Field(default=0, ge=0)
+    hosts_source: HostsSource = "dns"
     dns_servers: list[str] = Field(default_factory=lambda: ["1.1.1.1", "8.8.8.8"])
     dns_providers: list[Literal["google", "cloudflare", "alidns", "dns"]] = Field(
         default_factory=lambda: ["google", "cloudflare", "alidns", "dns"],
