@@ -43,7 +43,7 @@ MEDIAFORGE_HOSTS_INTERVAL_SECONDS=0
 # 可单独执行；serve 启动时也会自动执行同一幂等初始化。
 .\.venv\Scripts\mediaforge.exe init-db
 
-# 交互输入密码，不回显；无默认账号密码。密码至少 12 位。
+# 交互输入密码，不回显；无默认账号密码。密码长度为 4–128 位。
 .\.venv\Scripts\mediaforge.exe create-admin --username admin
 
 # 单进程启动，同时提供 API 和构建好的 Vue 页面。

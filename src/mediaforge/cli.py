@@ -26,7 +26,7 @@ def main() -> None:
             if args.command in {"create-admin", "reset-password"}:
                 if not USERNAME.fullmatch(args.username):
                     parser.error("用户名需为 3–64 位英文字母、数字、下划线、点或短横线")
-                password = getpass.getpass("请输入密码（12–128 位）: ")
+                password = getpass.getpass("请输入密码（4–128 位）: ")
                 if password != getpass.getpass("再次输入密码: "):
                     parser.error("两次密码不一致")
                 password_hash = hash_password(password)

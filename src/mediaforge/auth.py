@@ -27,24 +27,24 @@ class LoginRequest(BaseModel):
 
 class UserCreate(BaseModel):
     username: str = Field(min_length=3, max_length=64)
-    password: str = Field(min_length=12, max_length=128)
+    password: str = Field(min_length=4, max_length=128)
     role: Literal["admin", "viewer"] = "viewer"
 
 
 class UserUpdate(BaseModel):
     role: Literal["admin", "viewer"]
     active: bool
-    password: str | None = Field(default=None, min_length=12, max_length=128)
+    password: str | None = Field(default=None, min_length=4, max_length=128)
 
 
 class PasswordChange(BaseModel):
     old_password: str = Field(min_length=1, max_length=128)
-    new_password: str = Field(min_length=12, max_length=128)
+    new_password: str = Field(min_length=4, max_length=128)
 
 
 def hash_password(password: str) -> str:
-    if not 12 <= len(password) <= 128:
-        raise ValueError("密码长度必须为 12–128 个字符")
+    if not 4 <= len(password) <= 128:
+        raise ValueError("密码长度必须为 4–128 个字符")
     salt = secrets.token_hex(16)
     digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), ITERATIONS).hex()
     return f"pbkdf2_sha256${ITERATIONS}${salt}${digest}"

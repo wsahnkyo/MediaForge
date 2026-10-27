@@ -551,7 +551,7 @@ async function changePassword() {
         <h2>用户管理</h2><p>管理员可修改文件、更新 hosts 和管理用户；只读用户仅可浏览、查询和查看日志。</p>
         <form class="toolbar" @submit.prevent="createUser">
           <input v-model="newUser.username" placeholder="用户名（3–64 位英文、数字、_.-）" required maxlength="64" :disabled="busy" />
-          <input v-model="newUser.password" type="password" autocomplete="new-password" placeholder="初始密码（至少 12 位）" required minlength="12" maxlength="128" :disabled="busy" />
+          <input v-model="newUser.password" type="password" autocomplete="new-password" placeholder="初始密码（4–128 位）" required minlength="4" maxlength="128" :disabled="busy" />
           <select v-model="newUser.role" :disabled="busy"><option value="viewer">只读用户</option><option value="admin">管理员</option></select>
           <button :disabled="busy">创建用户</button>
         </form>
@@ -564,7 +564,7 @@ async function changePassword() {
           <div class="toolbar">
             <select v-model="userEdit.role" :disabled="busy"><option value="viewer">只读用户</option><option value="admin">管理员</option></select>
             <label><input v-model="userEdit.active" type="checkbox" :disabled="busy" /> 启用</label>
-            <input v-model="resetPassword" type="password" autocomplete="new-password" placeholder="新密码（留空不变）" minlength="12" maxlength="128" :disabled="busy" />
+            <input v-model="resetPassword" type="password" autocomplete="new-password" placeholder="新密码（4–128 位，留空不变）" minlength="4" maxlength="128" :disabled="busy" />
             <button :disabled="busy">保存并注销该用户旧会话</button><button type="button" :disabled="busy" @click="userEdit = null">取消</button>
           </div>
         </form>
@@ -581,7 +581,7 @@ async function changePassword() {
         <h3>修改我的密码</h3>
         <form class="toolbar" @submit.prevent="changePassword">
           <input v-model="oldPassword" type="password" autocomplete="current-password" placeholder="原密码" required maxlength="128" :disabled="busy" />
-          <input v-model="newPassword" type="password" autocomplete="new-password" placeholder="新密码（至少 12 位）" required minlength="12" maxlength="128" :disabled="busy" />
+          <input v-model="newPassword" type="password" autocomplete="new-password" placeholder="新密码（4–128 位）" required minlength="4" maxlength="128" :disabled="busy" />
           <button :disabled="busy">修改密码并退出所有会话</button>
         </form>
       </section>
