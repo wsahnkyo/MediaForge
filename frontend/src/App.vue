@@ -126,15 +126,17 @@ interface RuntimeLog {
 class ApiError extends Error {
   constructor(message: string, public report?: HostReport) { super(message); }
 }
-interface Operation {
+interface OperationSummary {
   id: string;
   kind: string;
   actor: string;
   status: string;
-  request: unknown;
-  result: unknown;
   error: string | null;
   created_at: string;
+}
+interface Operation extends OperationSummary {
+  request: unknown;
+  result: unknown;
 }
 interface User {
   id: string;
@@ -300,7 +302,9 @@ const plan = ref<FilePlan | null>(null);
 const plannedRequest = ref<FileRequest | null>(null);
 const hostReport = ref<HostReport | null>(null);
 const hostSource = ref<HostsSource>("dns");
-const records = ref<Operation[]>([]);
+const records = ref<OperationSummary[]>([]);
+const recordsVersion = ref(0);
+const operationDetails = ref<Record<string, { loading: boolean; error: string; data?: Operation }>>({});
 const busy = ref(false);
 const error = ref("");
 const notice = ref("");
@@ -465,7 +469,7 @@ async function loadWorkspace() {
   videoInfoRoot.value = config.value.roots[0]?.id ?? -1;
   videoInfoRows.value = [];
   connected.value = true;
-  records.value = await api<Operation[]>("/operations");
+  await loadRecords();
   await Promise.all([loadMetadataMappings(), loadScrapers(), loadFiles(), loadRenameRules(), loadVideoStatus()]);
 }
 
@@ -606,6 +610,7 @@ async function logout() {
     config.value = null;
     mediaRootsDraft.value = []; mediaFolderListing.value = null; mediaFolderError.value = "";
     entries.value = []; records.value = []; users.value = [];
+    recordsVersion.value++; operationDetails.value = {};
     runtimeLog.value = null;
     scrapers.value = [];
     savedScrapers.value = [];
@@ -1057,9 +1062,34 @@ onUnmounted(() => {
   window.removeEventListener("hashchange", syncTabFromHash);
 });
 
+async function loadRecords() {
+  const data = await api<OperationSummary[]>("/operations?summary=true");
+  recordsVersion.value++;
+  operationDetails.value = {};
+  records.value = data;
+}
+async function loadOperation(id: string) {
+  const existing = operationDetails.value[id];
+  if (existing?.loading || (existing?.data && existing.data.status !== "running")) return;
+  const version = recordsVersion.value;
+  operationDetails.value[id] = { loading: true, error: "" };
+  try {
+    const data = await api<Operation>(`/operations/${encodeURIComponent(id)}`);
+    if (connected.value && recordsVersion.value === version) {
+      operationDetails.value[id] = { loading: false, error: "", data };
+    }
+  } catch (cause) {
+    if (connected.value && recordsVersion.value === version) {
+      operationDetails.value[id] = { loading: false, error: cause instanceof Error ? cause.message : String(cause) };
+    }
+  }
+}
+function toggleOperation(id: string, event: Event) {
+  if (event.target instanceof HTMLDetailsElement && event.target.open) void loadOperation(id);
+}
 async function showRecords() {
   tab.value = "operations";
-  await run(async () => { records.value = await api<Operation[]>("/operations"); });
+  await run(loadRecords);
 }
 
 async function showUsers() {
@@ -1530,7 +1560,12 @@ async function changePassword() {
           <tbody><tr v-for="record in records" :key="record.id">
             <td>{{ new Date(record.created_at).toLocaleString() }}</td><td>{{ record.actor }} / {{ record.kind }}</td>
             <td><span class="status-chip" :class="{ 'status-error': record.status === 'failed', 'status-warning': record.status !== 'success' && record.status !== 'failed' }">{{ ({ success: "成功", failed: "失败", running: "执行中 / 待核对", partial: "部分成功" } as Record<string, string>)[record.status] || record.status }}</span></td>
-            <td><details><summary>{{ record.error || record.id }}</summary><pre>{{ JSON.stringify({ request: record.request, result: record.result }, null, 2) }}</pre></details></td>
+            <td><details :key="`${record.id}-${recordsVersion}`" @toggle="toggleOperation(record.id, $event)">
+              <summary>{{ record.error || record.id }}</summary>
+              <p v-if="operationDetails[record.id]?.loading" role="status">正在加载详情…</p>
+              <div v-else-if="operationDetails[record.id]?.error" class="message error" role="alert">{{ operationDetails[record.id]?.error }} <button @click="loadOperation(record.id)">重试</button></div>
+              <pre v-else-if="operationDetails[record.id]?.data">{{ JSON.stringify({ request: operationDetails[record.id]?.data?.request, result: operationDetails[record.id]?.data?.result }, null, 2) }}</pre>
+            </details></td>
           </tr><tr v-if="!records.length"><td colspan="4">暂无操作记录</td></tr></tbody>
         </table></div>
       </section>

@@ -12,6 +12,7 @@ from contextlib import ExitStack, closing, contextmanager
 from dataclasses import dataclass, field
 from hashlib import sha256
 from pathlib import Path
+from threading import Lock
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -333,6 +334,7 @@ class Preview:
     created: float
     artifacts: list[Artifact] = field(default_factory=list)
     rows: list[dict[str, Any]] = field(default_factory=list)
+    ready: bool = False
 
 
 class MetadataService:
@@ -340,6 +342,7 @@ class MetadataService:
         self.settings = settings
         self.files = files
         self.store = store
+        self.lock = Lock()
         self.previews: dict[str, Preview] = {}
         self.scrapers = ScraperService(
             settings,
@@ -510,7 +513,7 @@ class MetadataService:
             return self.store.execute("metadata.mapping.delete", {"id": mapping_id}, apply)
 
     def cleanup_mappings(self, request: MetadataCleanup) -> dict[str, Any]:
-        with self.files.lock:
+        with self.lock:
             return self.store.execute(
                 "metadata.mapping.cleanup",
                 request.model_dump(),
@@ -518,6 +521,9 @@ class MetadataService:
             )
 
     def _cleanup_mappings(self, request: MetadataCleanup) -> dict[str, Any]:
+        with self.files.lock:
+            roots_version = self.files.roots_version
+            mappings = self.mappings()
         client = None
         blocked_reason = ""
         try:
@@ -527,7 +533,7 @@ class MetadataService:
         rows: list[dict[str, Any]] = []
         checks: dict[tuple[str, int], tuple[str, str]] = {}
         try:
-            for mapping in self.mappings():
+            for mapping in mappings:
                 row = {**mapping, "status": "unverified", "reason": "", "removed": False}
                 rows.append(row)
                 root = mapping["root"]
@@ -535,10 +541,12 @@ class MetadataService:
                     row["reason"] = "媒体根目录不在当前白名单中，保留关联；可手工解除"
                     continue
                 try:
-                    folder = self.files.resolve(root, mapping["folder_path"], must_exist=False)
-                    if not stat.S_ISDIR(folder.stat().st_mode):
-                        row.update(status="missing_folder", reason="影视文件夹已不存在")
-                        continue
+                    with self.files.lock:
+                        self.files.check_roots_version(roots_version)
+                        folder = self.files.resolve(root, mapping["folder_path"], must_exist=False)
+                        if not stat.S_ISDIR(folder.stat().st_mode):
+                            row.update(status="missing_folder", reason="影视文件夹已不存在")
+                            continue
                 except FileNotFoundError:
                     row.update(status="missing_folder", reason="影视文件夹已不存在")
                     continue
@@ -567,7 +575,8 @@ class MetadataService:
                             checks[key] = "unverified", str(exc)
                 row["status"], row["reason"] = checks[key]
             if not request.dry_run:
-                with self.store.sessions() as session:
+                with self.files.lock, self.store.sessions() as session:
+                    self.files.check_roots_version(roots_version)
                     for row in rows:
                         if row["status"] not in {"missing_folder", "missing_id"}:
                             continue
@@ -689,62 +698,43 @@ class MetadataService:
 
     def preview(self, request: MetadataPreview) -> dict[str, Any]:
         payload = request.model_dump()
-        with self.files.lock:
-            self.files.check_roots_version(request.roots_version)
+        with self.lock:
+            with self.files.lock:
+                self.files.check_roots_version(request.roots_version)
             return self.store.execute("metadata.preview", payload, lambda: self._preview(request))
 
+    def _check_preview(self, preview_id: str, preview: Preview) -> None:
+        self.files.check_roots_version(preview.request.roots_version)
+        if self.previews.get(preview_id) is not preview:
+            raise ValueError("配置或影视关联已变化，请重新预览")
+
     def _preview(self, request: MetadataPreview) -> dict[str, Any]:
-        selected = self.scrapers.selection(request.scrapers)
         with self.files.lock:
+            self.files.check_roots_version(request.roots_version)
+            request = request.model_copy(update={"roots_version": self.files.roots_version})
+            selected = self.scrapers.selection(request.scrapers)
             folder = self.files.resolve(request.root, request.path)
             videos = self._videos(request.root, request.path)
-        with self.store.sessions() as session:
-            mappings = {
-                mapping.location_key: mapping.tmdb_id
-                for mapping in session.scalars(
-                    select(MetadataMapping).where(MetadataMapping.media_type == request.media_type)
+            location_key = self._location_key(folder)
+            with self.store.sessions() as session:
+                known_tmdb = session.scalar(
+                    select(MetadataMapping.tmdb_id).where(
+                        MetadataMapping.media_type == request.media_type,
+                        MetadataMapping.location_key == location_key,
+                    )
                 )
+            preview = Preview(
+                request=request.model_copy(update={"api_key": None, "scrapers": selected}),
+                actor=operation_actor.get(),
+                created=time.monotonic(),
+            )
+            row: dict[str, Any] = {
+                "folder": request.path,
+                "folder_name": folder.name,
+                "location_key": location_key,
+                "status": "skipped",
             }
-        preview = Preview(
-            request=request.model_copy(update={"api_key": None, "scrapers": selected}),
-            actor=operation_actor.get(),
-            created=time.monotonic(),
-        )
-        row: dict[str, Any] = {
-            "folder": request.path,
-            "folder_name": folder.name,
-            "location_key": self._location_key(folder),
-            "status": "skipped",
-        }
-        rows = [row]
-        with self._clients(selected, request.api_key, request.language) as clients:
-            try:
-                known_tmdb = mappings.get(row["location_key"]) if "tmdb" in selected else None
-                row["match_source"] = "manual" if known_tmdb is not None else "automatic"
-                row["tmdb_id"] = known_tmdb
-                match = self._resolve_metadata(request, folder.name, known_tmdb, clients)
-                data = match.data
-                artifacts, warnings = self._artifacts(request, request.path, match, clients, videos)
-                preview.artifacts.extend(artifacts)
-                row.update(
-                    status="matched",
-                    title=data.get("name" if request.media_type == "tv" else "title"),
-                    year=(
-                        data.get("first_air_date" if request.media_type == "tv" else "release_date")
-                        or ""
-                    )[:4],
-                    tmdb_id=match.ids.get("tmdb"),
-                    scrapers=list(match.ids),
-                    files=[item.path for item in artifacts],
-                    warnings=match.warnings + warnings,
-                )
-            except NoMetadataMatch as exc:
-                row["reason"] = str(exc)
-            except (ValueError, OSError) as exc:
-                row.update(status="failed", reason=str(exc))
-                logger.warning("刮削预览失败 folder=%s: %s", folder, exc)
-        preview_id = uuid4().hex
-        with self.files.lock:
+            rows = preview.rows = [row]
             self.previews = {
                 key: value
                 for key, value in self.previews.items()
@@ -752,10 +742,47 @@ class MetadataService:
             }
             if len(self.previews) >= 10:
                 raise ValueError("未执行的预览过多，请等待旧预览过期后重试")
-            if preview.artifacts:
+            preview_id = uuid4().hex
+            self.previews[preview_id] = preview
+        try:
+            with self._clients(selected, request.api_key, request.language) as clients:
+                try:
+                    known_tmdb = known_tmdb if "tmdb" in selected else None
+                    row["match_source"] = "manual" if known_tmdb is not None else "automatic"
+                    row["tmdb_id"] = known_tmdb
+                    match = self._resolve_metadata(request, folder.name, known_tmdb, clients)
+                    data = match.data
+                    artifacts, warnings = self._artifacts(
+                        request, request.path, match, clients, videos
+                    )
+                    preview.artifacts.extend(artifacts)
+                    row.update(
+                        status="matched",
+                        title=data.get("name" if request.media_type == "tv" else "title"),
+                        year=(
+                            data.get(
+                                "first_air_date" if request.media_type == "tv" else "release_date"
+                            )
+                            or ""
+                        )[:4],
+                        tmdb_id=match.ids.get("tmdb"),
+                        scrapers=list(match.ids),
+                        files=[item.path for item in artifacts],
+                        warnings=match.warnings + warnings,
+                    )
+                except NoMetadataMatch as exc:
+                    row["reason"] = str(exc)
+                except (ValueError, OSError) as exc:
+                    row.update(status="failed", reason=str(exc))
+                    logger.warning("刮削预览失败 folder=%s: %s", folder, exc)
+            with self.files.lock:
+                self._check_preview(preview_id, preview)
+                preview.ready = bool(preview.artifacts)
                 preview.created = time.monotonic()
-                self.previews[preview_id] = preview
-        preview.rows = rows
+        finally:
+            with self.files.lock:
+                if not preview.ready:
+                    self.previews.pop(preview_id, None)
         has_issues = any(row["status"] != "matched" or row.get("warnings") for row in rows)
         has_matches = any(row["status"] == "matched" for row in rows)
         return {
@@ -793,6 +820,7 @@ class MetadataService:
                     raise ValueError(f"多个媒体文件产生冲突的 NFO：{path}")
                 return
             with self.files.lock:
+                self.files.check_roots_version(request.roots_version)
                 target = self.files.resolve(request.root, path, must_exist=False)
                 before = signature(target)
                 source_before = (
@@ -886,48 +914,62 @@ class MetadataService:
         return videos
 
     def apply(self, request: MetadataApply) -> dict[str, Any]:
-        with self.files.lock:
-            preview = self.previews.get(request.preview_id)
-            if (
-                preview is None
-                or time.monotonic() - preview.created >= 1800
-                or preview.actor != operation_actor.get()
-            ):
-                raise ValueError("预览不存在、已过期或不属于当前用户，请重新预览")
-            if not preview.artifacts:
-                raise ValueError("预览中没有可写入的文件")
-            selected = self.scrapers.selection(preview.request.scrapers)
+        with self.lock:
+            with self.files.lock:
+                preview = self.previews.get(request.preview_id)
+                if (
+                    preview is None
+                    or not preview.ready
+                    or time.monotonic() - preview.created >= 1800
+                    or preview.actor != operation_actor.get()
+                ):
+                    raise ValueError("预览不存在、已过期或不属于当前用户，请重新预览")
+                if not preview.artifacts:
+                    raise ValueError("预览中没有可写入的文件")
+                selected = self.scrapers.selection(preview.request.scrapers)
             with self._clients(selected, request.api_key, preview.request.language) as clients:
-                # Consume before mutating; a failed response must not encourage replay.
-                del self.previews[request.preview_id]
-                return self.store.execute(
-                    "metadata.apply",
-                    {"preview_id": request.preview_id, **preview.request.model_dump()},
-                    lambda: self._apply(preview, clients),
-                )
+                try:
+                    return self.store.execute(
+                        "metadata.apply",
+                        {"preview_id": request.preview_id, **preview.request.model_dump()},
+                        lambda: self._apply(request.preview_id, preview, clients),
+                    )
+                finally:
+                    # The metadata lock prevents replay while I/O is in progress.
+                    with self.files.lock:
+                        self.previews.pop(request.preview_id, None)
 
-    def _apply(self, preview: Preview, clients: dict[str, ScraperClient]) -> dict[str, Any]:
+    def _validate_artifact(self, root: int, item: Artifact) -> None:
+        path = self.files.resolve(root, item.path, must_exist=False)
+        if not path.parent.is_dir() or signature(path) != item.before:
+            raise ValueError(f"预览后文件或目录发生变化，请重新预览：{item.path}")
+        if item.source and signature(self.files.resolve(root, item.source)) != item.source_before:
+            raise ValueError(f"预览后视频发生变化，请重新预览：{item.source}")
+
+    def _apply(
+        self, preview_id: str, preview: Preview, clients: dict[str, ScraperClient]
+    ) -> dict[str, Any]:
         root = preview.request.root
-        for item in preview.artifacts:
-            path = self.files.resolve(root, item.path, must_exist=False)
-            if not path.parent.is_dir() or signature(path) != item.before:
-                raise ValueError(f"预览后文件或目录发生变化，请重新预览：{item.path}")
-            if (
-                item.source
-                and signature(self.files.resolve(root, item.source)) != item.source_before
-            ):
-                raise ValueError(f"预览后视频发生变化，请重新预览：{item.source}")
+        with self.files.lock:
+            self._check_preview(preview_id, preview)
+            for item in preview.artifacts:
+                self._validate_artifact(root, item)
         results = []
         for item in preview.artifacts:
             result: dict[str, Any] = {"path": item.path, "status": "failed"}
             results.append(result)
             try:
+                with self.files.lock:
+                    self._check_preview(preview_id, preview)
                 content = (
                     clients[item.image_scraper].image(item.image) if item.image else item.content
                 )
                 if content is None:
                     raise ValueError("缺少待写入内容")
-                self._write(root, item, content, result)
+                with self.files.lock:
+                    self._check_preview(preview_id, preview)
+                    self._validate_artifact(root, item)
+                    self._write(root, item, content, result)
                 result["status"] = "success"
             except (ValueError, OSError) as exc:
                 result["error"] = str(exc)

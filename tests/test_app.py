@@ -16,6 +16,23 @@ from mediaforge.video_info import VideoInfoService
 HEADERS = {"X-MediaForge-Request": "1"}
 
 
+def test_operation_summaries_and_authenticated_detail(client):
+    result = client.app.state.store.execute(
+        "test.detail", {"input": "example"}, lambda: {"rows": ["detail"]}
+    )
+    path = "/api/operations/" + result["operation_id"]
+    assert client.get(path).status_code == 401
+    assert login(client, "viewer", "viewer-password-123").status_code == 200
+    summary = client.get("/api/operations?summary=true").json()[0]
+    assert summary["id"] == result["operation_id"]
+    assert "request" not in summary and "result" not in summary
+    detail = client.get(path).json()
+    assert detail["request"] == {"input": "example"}
+    assert detail["result"] == {"rows": ["detail"]}
+    assert client.get("/api/operations").json()[0] == detail
+    assert client.get("/api/operations/missing").status_code == 404
+
+
 def test_regex_rename_api_preview_edit_confirmation_and_unchanged_directory(client):
     assert client.get("/api/renaming/rules").status_code == 401
     assert login(client, "viewer", "viewer-password-123").status_code == 200

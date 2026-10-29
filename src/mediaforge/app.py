@@ -397,8 +397,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return hosts.update(body.dry_run, body.source)
 
     @app.get("/api/operations", dependencies=secured)
-    def operations():
-        return store.recent()
+    def operations(summary: bool = False):
+        return store.recent(summary=summary)
+
+    @app.get("/api/operations/{operation_id}", dependencies=secured)
+    def operation_detail(operation_id: str):
+        record = store.get(operation_id)
+        if record is None:
+            raise HTTPException(404, "操作记录不存在")
+        return record
 
     @app.get("/api/logs", dependencies=secured)
     def runtime_logs(limit: int = Query(default=200, ge=1, le=1000)):

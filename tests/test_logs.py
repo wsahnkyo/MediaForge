@@ -80,3 +80,39 @@ def test_tail_reads_recent_utf8_and_follows_rotation(settings):
         assert "失败原因" not in "\n".join(result["lines"])
     finally:
         service.close()
+
+
+def test_emitting_without_rotation_does_not_rescan_archives(tmp_path, monkeypatch):
+    path = tmp_path / "app.log"
+    archive(path, 100, 1)
+    handler = RetainedFileHandler(path, max_bytes=100000, total_bytes=200000, days=7)
+    scans = []
+    original = Path.iterdir
+
+    def iterdir(folder):
+        if folder == tmp_path:
+            scans.append(folder)
+        return original(folder)
+
+    monkeypatch.setattr(Path, "iterdir", iterdir)
+    try:
+        for _ in range(30):
+            handler.handle(logging.LogRecord("test", logging.INFO, "", 0, "message", (), None))
+        assert len(scans) == 1
+    finally:
+        handler.close()
+
+
+def test_total_budget_enforced_between_rotations(tmp_path):
+    path = tmp_path / "app.log"
+    previous = archive(path, 150, 1)
+    handler = RetainedFileHandler(path, max_bytes=200, total_bytes=200, days=7)
+    record = logging.LogRecord("test", logging.INFO, "", 0, "x" * 40, (), None)
+    try:
+        handler.handle(record)
+        assert previous.exists()
+        handler.handle(record)
+        assert not previous.exists()
+        assert path.stat().st_size == 82
+    finally:
+        handler.close()

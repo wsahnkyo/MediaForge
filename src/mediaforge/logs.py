@@ -20,6 +20,8 @@ class RetainedFileHandler(BaseRotatingHandler):
         self.total_bytes = total_bytes
         self.max_age = days * 86400
         self.last_error: str | None = None
+        self.archive_bytes = 0
+        self.cleanup_pending = True
         self.archive_pattern = re.compile(re.escape(path.name) + r"\.\d{8}T\d{12}Z\.[0-9a-f]{32}\Z")
         self.day = datetime.fromtimestamp(
             path.stat().st_mtime if path.exists() else time.time(), UTC
@@ -45,6 +47,7 @@ class RetainedFileHandler(BaseRotatingHandler):
         self.path.rename(self.path.with_name(self.path.name + "." + suffix))
         self.stream = self._open()
         self.day = datetime.now(UTC).date()
+        self.cleanup_pending = True
 
     def cleanup(self) -> None:
         self.acquire()
@@ -69,13 +72,19 @@ class RetainedFileHandler(BaseRotatingHandler):
                     break
                 path.unlink()
                 total -= size
+            self.archive_bytes = total - self.path.stat().st_size
+            self.cleanup_pending = False
         finally:
             self.release()
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
             super().emit(record)
-            self.cleanup()
+            if (
+                self.cleanup_pending
+                or self.archive_bytes + self.path.stat().st_size > self.total_bytes
+            ):
+                self.cleanup()
         except (OSError, ValueError):
             self.handleError(record)
 

@@ -3,7 +3,9 @@ import os
 import shutil
 import subprocess
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 
 import httpx
 import pytest
@@ -250,6 +252,81 @@ def test_preview_expiry_and_ownership(metadata, monkeypatch):
     metadata.previews[preview["preview_id"]].created -= 1801
     with pytest.raises(ValueError, match="过期"):
         metadata.apply(MetadataApply(preview_id=preview["preview_id"]))
+
+
+@pytest.mark.parametrize("change", ["none", "mapping", "roots"])
+def test_preview_network_releases_file_lock_and_rejects_stale_configuration(
+    metadata, monkeypatch, change
+):
+    entered, release = Event(), Event()
+    original = TMDBClient.details
+
+    def details(client, media_type, media_id):
+        entered.set()
+        assert release.wait(5)
+        return original(client, media_type, media_id)
+
+    monkeypatch.setattr(TMDBClient, "details", details)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        pending = pool.submit(metadata.preview, MetadataPreview(root=0, path="示例剧 (2020)"))
+        try:
+            assert entered.wait(5)
+            assert pool.submit(metadata.files.list, 0, "").result(timeout=3)["entries"]
+            if change == "mapping":
+                metadata.save_mapping(
+                    MetadataMappingInput(root=0, path="示例剧 (2020)", media_type="tv", tmdb_id=42)
+                )
+            elif change == "roots":
+                with metadata.files.lock:
+                    metadata.files.roots = []
+        finally:
+            release.set()
+        if change == "none":
+            assert pending.result(timeout=5)["file_count"] == 5
+        else:
+            with pytest.raises(ValueError, match="变化"):
+                pending.result(timeout=5)
+            assert not metadata.previews
+
+
+@pytest.mark.parametrize("change", ["source", "target", "configuration"])
+def test_image_download_releases_lock_and_revalidates_before_writes(metadata, monkeypatch, change):
+    plan = metadata.preview(MetadataPreview(root=0, path="示例剧 (2020)"))
+    entered, release = Event(), Event()
+    original = TMDBClient.image
+
+    def image(client, path):
+        entered.set()
+        assert release.wait(5)
+        return original(client, path)
+
+    monkeypatch.setattr(TMDBClient, "image", image)
+    series = metadata.files.roots[0] / "示例剧 (2020)"
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        pending = pool.submit(metadata.apply, MetadataApply(preview_id=plan["preview_id"]))
+        try:
+            assert entered.wait(5)
+            assert pool.submit(metadata.files.list, 0, "").result(timeout=3)["entries"]
+            with metadata.files.lock:
+                if change == "source":
+                    (series / "Show.S01E01.mkv").write_bytes(b"changed while downloading")
+                elif change == "target":
+                    (series / "poster.jpg").write_bytes(b"do not overwrite")
+                else:
+                    metadata.previews.clear()
+        finally:
+            release.set()
+        result = pending.result(timeout=5)
+    assert result["outcome"] == "partial"
+    if change == "source":
+        assert not (series / "Show.S01E01.nfo").exists()
+    elif change == "target":
+        assert (series / "poster.jpg").read_bytes() == b"do not overwrite"
+    else:
+        assert not (series / "poster.jpg").exists()
+        assert not (series / "Show.S01E01.nfo").exists()
+    assert plan["preview_id"] not in metadata.previews
+    assert any(item["status"] == "failed" for item in result["files"])
 
 
 def test_tmdb_network_errors_never_expose_key(caplog):

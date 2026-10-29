@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 from fractions import Fraction
 from hashlib import sha256
 from pathlib import Path
-from threading import RLock
+from threading import Lock, RLock
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -203,6 +203,7 @@ class VideoInfoService:
         self.files = files
         self.store = store
         self.lock = RLock()
+        self.scan_lock = Lock()
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="video-info")
         self.pending = False
         self.closing = False
@@ -392,25 +393,71 @@ class VideoInfoService:
             return {"rows": rows}
 
     def scan(self, request: VideoInfoRequest) -> dict[str, Any]:
-        with self.files.lock:
+        with self.scan_lock:
             if not locate_ffprobe():
                 raise ValueError("未找到 ffprobe，无法识别视频参数")
-            self.files.check_roots_version(request.roots_version)
-            self.files.resolve(request.root, request.path)
+            with self.files.lock:
+                self.files.check_roots_version(request.roots_version)
+                self.files.resolve(request.root, request.path)
+                request = request.model_copy(update={"roots_version": self.files.roots_version})
             return self.store.execute(
                 "video.info.scan", request.model_dump(), lambda: self._scan(request)
             )
 
+    def _save_batch(
+        self,
+        request: VideoInfoRequest,
+        pending: list[VideoFileMetadata],
+        summary: dict[str, int],
+    ) -> None:
+        with self.files.lock:
+            self.files.check_roots_version(request.roots_version)
+            valid = []
+            for record in pending:
+                try:
+                    path = self.files.resolve(request.root, record.file_path)
+                    if list(signature(path) or ()) != record.fingerprint:
+                        raise ValueError("视频在缓存写入前已变化")
+                except (OSError, ValueError) as exc:
+                    summary["deferred"] += 1
+                    logger.warning("视频缓存暂缓 file=%s: %s", record.file_path, exc)
+                    continue
+                valid.append(record)
+            if valid:
+                with self.store.sessions() as session:
+                    session.add_all(valid)
+                    session.commit()
+                for record in valid:
+                    summary["failed" if record.error else "analyzed"] += 1
+            pending.clear()
+
     def _scan(self, request: VideoInfoRequest) -> dict[str, Any]:
-        folder, entries = self._entries(request)
         summary = {"analyzed": 0, "cached": 0, "deferred": 0, "failed": 0}
         started = time.monotonic()
+        with self.files.lock:
+            folder, entries = self._entries(request)
+            root = self.files.root(request.root)
         with self.store.sessions() as session:
-            for item in entries:
-                if item["blocked"]:
-                    summary["deferred"] += 1
-                    logger.warning("视频参数识别跳过链接：%s", item["name"])
-                    continue
+            saved = {
+                record.location_key: record
+                for record in session.scalars(
+                    select(VideoFileMetadata).where(
+                        VideoFileMetadata.directory_key == self.key(folder)
+                    )
+                )
+            }
+        pending: list[VideoFileMetadata] = []
+        for index, item in enumerate(entries):
+            remaining = 120 - (time.monotonic() - started)
+            if remaining < 1:
+                summary["deferred"] += len(entries) - index
+                break
+            if item["blocked"]:
+                summary["deferred"] += 1
+                logger.warning("视频参数识别跳过链接：%s", item["name"])
+                continue
+            with self.files.lock:
+                self.files.check_roots_version(request.roots_version)
                 try:
                     path = self.files.resolve(request.root, item["path"])
                     before = signature(path)
@@ -420,42 +467,49 @@ class VideoInfoService:
                     summary["deferred"] += 1
                     logger.warning("视频识别暂缓 file=%s: %s", item["path"], exc)
                     continue
-                record = session.get(VideoFileMetadata, self.key(path))
-                if (
-                    not request.force
-                    and record
-                    and record.details is not None
-                    and not record.error
-                    and record.fingerprint == list(before)
-                ):
-                    summary["cached"] += 1
-                    continue
-                remaining = 120 - (time.monotonic() - started)
-                if time.time() - path.stat().st_mtime < STABLE_SECONDS or remaining < 1:
-                    summary["deferred"] += 1
-                    continue
-                details, error = None, None
+            record = saved.get(self.key(path))
+            if (
+                not request.force
+                and record
+                and record.details is not None
+                and not record.error
+                and record.fingerprint == list(before)
+            ):
+                summary["cached"] += 1
+                continue
+            if time.time() - before[1] / 1_000_000_000 < STABLE_SECONDS:
+                summary["deferred"] += 1
+                continue
+            details, error = None, None
+            try:
+                details = normalize(self.probe(path, min(20, remaining)), before[0])
+            except (OSError, ValueError) as exc:
+                error = str(exc)[:2000]
+                logger.warning("视频参数识别失败 file=%s: %s", path, exc)
+            with self.files.lock:
+                self.files.check_roots_version(request.roots_version)
                 try:
-                    details = normalize(self.probe(path, min(20, remaining)), before[0])
+                    path = self.files.resolve(request.root, item["path"], must_exist=False)
+                    if signature(path) != before:
+                        raise ValueError("视频在识别期间已变化")
                 except (OSError, ValueError) as exc:
-                    error = str(exc)[:2000]
-                    logger.warning("视频参数识别失败 file=%s: %s", path, exc)
-                if signature(path) != before:
                     summary["deferred"] += 1
-                    logger.info("视频仍在变化，暂不保存识别结果：%s", path)
+                    logger.warning("视频缓存暂缓 file=%s: %s", item["path"], exc)
                     continue
-                if record is None:
-                    record = VideoFileMetadata(location_key=self.key(path))
-                    session.add(record)
-                record.directory_key = self.key(folder)
-                record.root_path = str(self.files.root(request.root))
-                record.file_path = item["path"]
-                record.fingerprint = list(before)
-                record.details = details
-                record.error = error
-                record.scanned_at = datetime.now(UTC)
-                session.commit()
-                summary["failed" if error else "analyzed"] += 1
+            if record is None:
+                record = VideoFileMetadata(location_key=self.key(path))
+            record.directory_key = self.key(folder)
+            record.root_path = str(root)
+            record.file_path = item["path"]
+            record.fingerprint = list(before)
+            record.details = details
+            record.error = error
+            record.scanned_at = datetime.now(UTC)
+            pending.append(record)
+            if len(pending) >= 20:
+                self._save_batch(request, pending, summary)
+        if pending:
+            self._save_batch(request, pending, summary)
         return {
             **summary,
             "outcome": "partial" if summary["failed"] or summary["deferred"] else "success",

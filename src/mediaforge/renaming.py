@@ -135,7 +135,7 @@ class RenamePlan:
     rules_version: str
     created: float = field(default_factory=time.monotonic)
     rows: list[dict[str, Any]] = field(default_factory=list)
-    entries: list[dict[str, Any]] = field(default_factory=list)
+    companions: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
 
 class RenameService:
@@ -245,12 +245,32 @@ class RenameService:
             raise ValueError("预览后当前目录中的文件已变化，请重新预览")
         return plan
 
+    @staticmethod
+    def _companion_index(entries: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+        stems = {
+            Path(item["name"]).stem.casefold()
+            for item in entries
+            if not item["directory"] and Path(item["name"]).suffix.lower() in VIDEO_EXTENSIONS
+        }
+        companions: dict[str, list[dict[str, Any]]] = {}
+        for item in entries:
+            path = Path(item["name"])
+            if item["directory"] or path.suffix.lower() not in SIDECARS:
+                continue
+            owner = path.stem.casefold()
+            if path.suffix.lower() != ".nfo":
+                while owner and owner not in stems:
+                    owner = owner.rpartition(".")[0]
+            if owner in stems:
+                companions.setdefault(owner, []).append(item)
+        return companions
+
     def _target_files(
         self,
         request: RenamePreviewRequest,
         source: str,
         new_name: str,
-        entries: list[dict[str, Any]],
+        companions: dict[str, list[dict[str, Any]]],
     ) -> list[dict[str, Any]]:
         video = self.files.resolve(request.root, source)
         validate_name(new_name)
@@ -258,30 +278,8 @@ class RenameService:
             raise ValueError("必须保留视频原扩展名，不允许修改格式")
         target = video.with_name(new_name)
         pairs = [(video, target)]
-        stems = {
-            Path(item["name"]).stem.casefold()
-            for item in entries
-            if not item["directory"] and Path(item["name"]).suffix.lower() in VIDEO_EXTENSIONS
-        }
-        for item in entries:
+        for item in companions.get(video.stem.casefold(), []):
             companion = Path(item["name"])
-            if item["directory"] or companion.suffix.lower() not in SIDECARS:
-                continue
-            if not companion.name.casefold().startswith(video.stem.casefold() + "."):
-                continue
-            if (
-                companion.suffix.lower() == ".nfo"
-                and companion.stem.casefold() != video.stem.casefold()
-            ):
-                continue
-            owners = [
-                stem
-                for stem in stems
-                if companion.stem.casefold() == stem
-                or companion.stem.casefold().startswith(stem + ".")
-            ]
-            if owners and max(owners, key=len) != video.stem.casefold():
-                continue
             if item["blocked"]:
                 raise ValueError("同名 NFO / 字幕是链接，已跳过整组文件")
             suffix = companion.name[len(video.stem) :]
@@ -312,7 +310,9 @@ class RenameService:
         row["new_name"] = new_name
         row["files"] = []
         try:
-            row["files"] = self._target_files(plan.request, row["source"], new_name, plan.entries)
+            row["files"] = self._target_files(
+                plan.request, row["source"], new_name, plan.companions
+            )
             row["status"] = "ready" if row["files"] else "unchanged"
             row["reason"] = "" if row["files"] else "文件名已经符合规则"
         except (OSError, ValueError) as error:
@@ -369,7 +369,7 @@ class RenameService:
             fingerprint,
             version,
         )
-        plan.entries = listing
+        plan.companions = self._companion_index(listing)
         timed_out = set()
         started = time.monotonic()
         for item in listing:

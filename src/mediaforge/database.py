@@ -10,6 +10,7 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     ForeignKey,
+    Index,
     MetaData,
     String,
     UniqueConstraint,
@@ -18,7 +19,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, defer, mapped_column, sessionmaker
 
 operation_actor: ContextVar[str | None] = ContextVar("operation_actor", default=None)
 logger = logging.getLogger(__name__)
@@ -50,6 +51,9 @@ class Operation(Base):
         DateTime(timezone=True), default=lambda: datetime.now(UTC)
     )
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+OPERATION_TIME_INDEX = Index("ix_mediaforge_operations_created_at", Operation.created_at)
 
 
 class User(Base):
@@ -154,6 +158,8 @@ def initialize_database(engine) -> None:
         connection.execute(text("SELECT pg_advisory_xact_lock(704019319)"))
         connection.execute(text("CREATE SCHEMA IF NOT EXISTS mediaforge"))
         Base.metadata.create_all(connection)
+        # create_all does not add indexes to tables that already exist.
+        OPERATION_TIME_INDEX.create(connection, checkfirst=True)
 
 
 class OperationStore:
@@ -172,22 +178,23 @@ class OperationStore:
             session.commit()
             operation_id = record.id
         logger.info("操作开始 id=%s type=%s actor=%s", operation_id, kind, record.actor)
-        with self.sessions() as session:
-            if session.bind is not None and session.bind.dialect.name == "postgresql":
-                session.execute(text("SELECT pg_advisory_xact_lock(704019320)"))
-            record = session.get(Operation, operation_id)
-            assert record is not None
-            try:
-                result = action()
-            except (OSError, ValueError, RuntimeError) as exc:
+        try:
+            result = action()
+        except (OSError, ValueError, RuntimeError) as exc:
+            with self.sessions() as session:
+                record = session.get(Operation, operation_id)
+                assert record is not None
                 record.status = "failed"
                 record.error = str(exc)[:2000]
                 if isinstance(exc, OperationFailure):
                     record.result = exc.result
                 record.finished_at = datetime.now(UTC)
                 session.commit()
-                logger.error("操作失败 id=%s type=%s: %s", operation_id, kind, exc)
-                raise
+            logger.error("操作失败 id=%s type=%s: %s", operation_id, kind, exc)
+            raise
+        with self.sessions() as session:
+            record = session.get(Operation, operation_id)
+            assert record is not None
             record.status = result.get("outcome", "success")
             record.result = result
             record.finished_at = datetime.now(UTC)
@@ -195,21 +202,28 @@ class OperationStore:
             logger.info("操作结束 id=%s type=%s status=%s", operation_id, kind, record.status)
             return {"operation_id": operation_id, **result}
 
-    def recent(self) -> list[dict[str, Any]]:
+    @staticmethod
+    def _data(item: Operation, *, summary: bool = False) -> dict[str, Any]:
+        data = {
+            "id": item.id,
+            "kind": item.kind,
+            "actor": item.actor,
+            "status": item.status,
+            "error": item.error,
+            "created_at": item.created_at.isoformat(),
+        }
+        if not summary:
+            data.update(request=item.request, result=item.result)
+        return data
+
+    def recent(self, *, summary: bool = False) -> list[dict[str, Any]]:
         with self.sessions() as session:
-            records = session.scalars(
-                select(Operation).order_by(Operation.created_at.desc()).limit(100)
-            )
-            return [
-                {
-                    "id": item.id,
-                    "kind": item.kind,
-                    "actor": item.actor,
-                    "status": item.status,
-                    "request": item.request,
-                    "result": item.result,
-                    "error": item.error,
-                    "created_at": item.created_at.isoformat(),
-                }
-                for item in records
-            ]
+            query = select(Operation).order_by(Operation.created_at.desc()).limit(100)
+            if summary:
+                query = query.options(defer(Operation.request), defer(Operation.result))
+            return [self._data(item, summary=summary) for item in session.scalars(query)]
+
+    def get(self, operation_id: str) -> dict[str, Any] | None:
+        with self.sessions() as session:
+            record = session.get(Operation, operation_id)
+            return self._data(record) if record is not None else None

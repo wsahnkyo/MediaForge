@@ -7,6 +7,7 @@ from mediaforge.renaming import (
     RenamePreviewRequest,
     RenameReviewRequest,
     RenameService,
+    RuleInput,
     RulesUpdate,
 )
 
@@ -210,6 +211,53 @@ def test_nfo_and_language_subtitles_follow_video_in_same_preview(renaming):
     apply(renaming, report)
     for suffix in (".mkv", ".nfo", ".zh-CN.srt"):
         assert (renaming.files.roots[0] / ("01" + suffix)).exists()
+
+
+def test_companions_belong_to_longest_video_stem(renaming):
+    renaming.save_rules(
+        RulesUpdate(rules=[RuleInput(name="last number", pattern=r"(?P<episode>\d{2})$")])
+    )
+    for name in (
+        "Show.01.mkv",
+        "Show.01.nfo",
+        "Show.01.02.mkv",
+        "Show.01.02.nfo",
+        "Show.01.02.zh-CN.srt",
+    ):
+        add(renaming, name, name.encode())
+    report = preview(renaming)
+    assert report["ready_count"] == 2
+    assert report["file_count"] == 5
+    apply(renaming, report)
+    root = renaming.files.roots[0]
+    assert (root / "01.nfo").read_bytes() == b"Show.01.nfo"
+    assert (root / "02.nfo").read_bytes() == b"Show.01.02.nfo"
+    assert (root / "02.zh-CN.srt").read_bytes() == b"Show.01.02.zh-CN.srt"
+
+
+def test_preview_indexes_directory_once_instead_of_once_per_video(renaming, monkeypatch):
+    for index in range(1, 101):
+        add(renaming, f"Show.EP{index:03}.mkv")
+    visits = 0
+
+    class CountedEntries(list):
+        def __iter__(self):
+            nonlocal visits
+            for item in super().__iter__():
+                visits += 1
+                yield item
+
+    original = renaming.files.list
+
+    def listing(*args):
+        result = original(*args)
+        result["entries"] = CountedEntries(result["entries"])
+        return result
+
+    monkeypatch.setattr(renaming.files, "list", listing)
+    report = preview(renaming)
+    assert report["ready_count"] == 100
+    assert visits <= 500
 
 
 def test_legacy_default_template_and_season_capture_only_produce_episode(renaming):

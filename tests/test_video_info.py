@@ -2,11 +2,13 @@ import os
 import struct
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import event, select
 
 from mediaforge import video_info
 from mediaforge.database import VideoFileMetadata
@@ -100,6 +102,73 @@ def test_changed_files_reinspect_but_recent_files_wait(info):
     assert info.scan(VideoInfoRequest(root=0))["analyzed"] == 1
     assert len(info.calls) == 2
     assert info.scan(VideoInfoRequest(root=0, force=True))["analyzed"] == 1
+
+
+def test_cached_directory_uses_one_cache_query(info):
+    for index in range(25):
+        add_video(info.files.roots[0], f"{index:02}.mkv")
+    assert info.scan(VideoInfoRequest(root=0))["analyzed"] == 25
+    statements = []
+    engine = info.store.sessions.kw["bind"]
+
+    def capture(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith("SELECT") and "video_file_metadata" in statement:
+            statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        assert info.scan(VideoInfoRequest(root=0))["cached"] == 25
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+    assert len(statements) == 1
+
+
+@pytest.mark.parametrize("change_roots", [False, True])
+def test_probe_releases_file_lock_and_rechecks_configuration(info, monkeypatch, change_roots):
+    add_video(info.files.roots[0])
+    entered, release = Event(), Event()
+
+    def probe(path, timeout):
+        entered.set()
+        assert release.wait(5)
+        return sample()
+
+    monkeypatch.setattr(info, "probe", probe)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        scanning = pool.submit(info.scan, VideoInfoRequest(root=0))
+        try:
+            assert entered.wait(5)
+            assert pool.submit(info.files.list, 0, "").result(timeout=3)["entries"]
+            if change_roots:
+                replacement = info.files.roots[0].with_name("replacement")
+                replacement.mkdir()
+                with info.files.lock:
+                    info.files.roots = [replacement]
+        finally:
+            release.set()
+        if change_roots:
+            with pytest.raises(ValueError, match="配置已变化"):
+                scanning.result(timeout=5)
+            with info.store.sessions() as session:
+                assert list(session.scalars(select(VideoFileMetadata))) == []
+        else:
+            assert scanning.result(timeout=5)["analyzed"] == 1
+
+
+def test_batch_revalidates_earlier_files_before_saving(info, monkeypatch):
+    first = add_video(info.files.roots[0], "01.mkv")
+    add_video(info.files.roots[0], "02.mkv")
+
+    def probe(path, timeout):
+        if path.name == "02.mkv":
+            first.write_bytes(b"changed before batch commit")
+        return sample()
+
+    monkeypatch.setattr(info, "probe", probe)
+    result = info.scan(VideoInfoRequest(root=0))
+    assert result["analyzed"] == 1 and result["deferred"] == 1
+    with info.store.sessions() as session:
+        assert list(session.scalars(select(VideoFileMetadata.file_path))) == ["02.mkv"]
 
 
 def test_only_common_video_extensions_are_listed_probed_and_saved(info):
