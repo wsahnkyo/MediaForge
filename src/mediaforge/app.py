@@ -1,5 +1,6 @@
 import logging
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
 
@@ -29,9 +30,26 @@ from mediaforge.database import (
     make_engine,
     operation_actor,
 )
-from mediaforge.files import FileAction, FileService
+from mediaforge.files import FileAction, FileService, MediaRootsUpdate
 from mediaforge.hosts import CHECKTMDB_URLS, HostsService
 from mediaforge.logs import LogService
+from mediaforge.metadata import (
+    MetadataApply,
+    MetadataCleanup,
+    MetadataMappingInput,
+    MetadataPreview,
+    MetadataSearch,
+    MetadataService,
+)
+from mediaforge.renaming import (
+    RenameApplyRequest,
+    RenamePreviewRequest,
+    RenameReviewRequest,
+    RenameService,
+    RulesUpdate,
+)
+from mediaforge.scrapers import ScraperSettingsUpdate
+from mediaforge.video_info import SCAN_INTERVAL_MINUTES, VideoInfoRequest, VideoInfoService
 
 logger = logging.getLogger(__name__)
 WEB = Path(__file__).with_name("web")
@@ -49,6 +67,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     store = OperationStore(sessions)
     auth = AuthService(sessions, settings.session_hours)
     files = FileService(settings.media_roots, store)
+    metadata = MetadataService(settings, files, store)
+    renaming = RenameService(files, store)
+    video_info = VideoInfoService(files, store)
     hosts = HostsService(settings, store)
     logs = LogService(settings)
     scheduler = BackgroundScheduler()
@@ -58,6 +79,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             logs.start()
             initialize_database(engine)
+            files.load_roots(settings)
             logger.info("MediaForge 启动，数据库初始化完成")
             if settings.hosts_interval_seconds:
                 scheduler.add_job(
@@ -68,11 +90,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     coalesce=True,
                 )
             scheduler.add_job(logs.cleanup, "interval", minutes=10, max_instances=1)
+            scheduler.add_job(
+                video_info.request_scan,
+                "interval",
+                minutes=SCAN_INTERVAL_MINUTES,
+                next_run_time=datetime.now(UTC),
+                max_instances=1,
+                coalesce=True,
+                id="video-info",
+            )
             scheduler.start()
             yield
         finally:
             if scheduler.running:
                 scheduler.shutdown(wait=True)
+            video_info.close()
             engine.dispose()
             logger.info("MediaForge 已停止")
             logs.close()
@@ -80,6 +112,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="MediaForge", version="0.1.0", lifespan=lifespan)
     app.state.store = store
     app.state.files = files
+    app.state.metadata = metadata
+    app.state.renaming = renaming
+    app.state.video_info = video_info
     app.state.hosts = hosts
     app.state.auth = auth
     app.state.logs = logs
@@ -223,15 +258,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def modules():
         return [
             {"id": "downloads", "name": "影视下载", "status": "planned"},
-            {"id": "metadata", "name": "元数据刮削", "status": "planned"},
+            {"id": "metadata", "name": "元数据刮削", "status": "available"},
             {"id": "files", "name": "文件管理", "status": "available"},
             {"id": "hosts", "name": "Hosts 更新", "status": "available"},
+            {"id": "video-info", "name": "视频参数识别", "status": "available"},
         ]
 
     @app.get("/api/config", dependencies=secured)
     def config():
+        with files.lock:
+            roots = [{"id": i, "path": str(root)} for i, root in enumerate(files.roots)]
+            roots_version = files.roots_version
         return {
-            "roots": [{"id": i, "path": str(root)} for i, root in enumerate(settings.media_roots)],
+            "roots": roots,
+            "roots_version": roots_version,
+            "tmdb_key_configured": bool(metadata.scrapers.credential("tmdb")),
             "hosts_path": str(settings.hosts_path),
             "hosts_interval_seconds": settings.hosts_interval_seconds,
             "hosts_source": settings.hosts_source,
@@ -247,13 +288,107 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "ip_family": settings.ip_family,
         }
 
+    @app.get("/api/config/media-folders", dependencies=admin)
+    def browse_media_folders(path: str | None = Query(default=None, max_length=2000)):
+        return files.browse_media_folders(path, settings)
+
+    @app.put("/api/config/media-roots", dependencies=admin)
+    def update_media_roots(body: MediaRootsUpdate):
+        with files.lock:
+            result = files.save_roots(body, settings)
+            metadata.previews.clear()
+            renaming.previews.clear()
+            video_info.request_scan()
+            return result
+
     @app.get("/api/files", dependencies=secured)
-    def list_files(root: int = 0, path: str = ""):
-        return files.list(root, path)
+    def list_files(root: int = 0, path: str = "", roots_version: str | None = None):
+        return files.list(root, path, roots_version)
 
     @app.post("/api/files/action", dependencies=admin)
     def file_action(action: FileAction):
         return files.execute(action)
+
+    @app.get("/api/renaming/rules", dependencies=secured)
+    def rename_rules():
+        return [rule.model_dump() for rule in renaming.rules()]
+
+    @app.put("/api/renaming/rules", dependencies=admin)
+    def save_rename_rules(body: RulesUpdate):
+        return renaming.save_rules(body)
+
+    @app.post("/api/renaming/preview", dependencies=admin)
+    def preview_renaming(body: RenamePreviewRequest):
+        return renaming.preview(body)
+
+    @app.post("/api/renaming/review", dependencies=admin)
+    def review_renaming(body: RenameReviewRequest):
+        return renaming.review(body)
+
+    @app.post("/api/renaming/apply", dependencies=admin)
+    def apply_renaming(body: RenameApplyRequest):
+        with files.lock:
+            result = renaming.apply(body)
+            metadata.previews.clear()
+            return result
+
+    @app.post("/api/metadata/preview", dependencies=admin)
+    def metadata_preview(body: MetadataPreview):
+        return metadata.preview(body)
+
+    @app.get("/api/video-info/status", dependencies=secured)
+    def video_info_status():
+        return video_info.status()
+
+    @app.get("/api/video-info", dependencies=secured)
+    def video_information(root: int = 0, path: str = "", roots_version: str | None = None):
+        return video_info.listing(
+            VideoInfoRequest(
+                root=root,
+                path=path,
+                roots_version=roots_version,
+            )
+        )
+
+    @app.post("/api/video-info/scan", dependencies=admin)
+    def inspect_videos(body: VideoInfoRequest):
+        return video_info.scan(body)
+
+    @app.post("/api/video-info/scan-all", dependencies=admin)
+    def inspect_all_videos():
+        return video_info.request_scan()
+
+    @app.get("/api/metadata/scrapers", dependencies=secured)
+    def metadata_scrapers():
+        return metadata.scrapers.configurations()
+
+    @app.put("/api/metadata/scrapers", dependencies=admin)
+    def update_metadata_scrapers(body: ScraperSettingsUpdate):
+        return metadata.save_scrapers(body)
+
+    @app.post("/api/metadata/search", dependencies=admin)
+    def metadata_search(body: MetadataSearch):
+        return metadata.search(body)
+
+    @app.get("/api/metadata/mappings", dependencies=secured)
+    def metadata_mappings():
+        return metadata.mappings()
+
+    @app.post("/api/metadata/mappings/cleanup", dependencies=admin)
+    def cleanup_metadata_mappings(body: MetadataCleanup):
+        return metadata.cleanup_mappings(body)
+
+    @app.post("/api/metadata/mappings", dependencies=admin)
+    def save_metadata_mapping(body: MetadataMappingInput):
+        return metadata.save_mapping(body)
+
+    @app.delete("/api/metadata/mappings/{mapping_id}", dependencies=admin)
+    def delete_metadata_mapping(mapping_id: str):
+        return metadata.delete_mapping(mapping_id)
+
+    @app.post("/api/metadata/apply", dependencies=admin)
+    def metadata_apply(body: MetadataApply):
+        return metadata.apply(body)
 
     @app.post("/api/hosts/update", dependencies=secured)
     def update_hosts(body: HostsUpdate, user: Annotated[dict, Depends(current_user)]):

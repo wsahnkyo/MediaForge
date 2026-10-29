@@ -1,14 +1,24 @@
 import errno
+import json
 import os
 import shutil
 import stat
+import time
+from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path, PureWindowsPath
 from threading import RLock
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
+from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
-from mediaforge.database import OperationStore
+from mediaforge.config import Settings, validate_media_targets
+from mediaforge.database import MediaRootSetting, OperationStore, operation_actor
+
+
+class MediaRootsUpdate(BaseModel):
+    roots: list[Annotated[str, Field(min_length=1, max_length=2000)]] = Field(max_length=32)
 
 
 class FileAction(BaseModel):
@@ -19,6 +29,26 @@ class FileAction(BaseModel):
     destination: str | None = Field(default=None, max_length=2000)
     dry_run: bool = True
     confirm_delete: str | None = None
+    roots_version: str | None = None
+    preview_id: str | None = None
+
+
+@dataclass
+class FilePreview:
+    request: dict[str, Any]
+    plan: dict[str, Any]
+    roots_version: str
+    actor: str | None
+    created: float
+
+
+def signature(path: Path) -> tuple[int, int, int] | None:
+    if not path.exists():
+        return None
+    if not path.is_file():
+        raise ValueError(f"目标不是普通文件：{path.name}")
+    info = path.stat()
+    return info.st_size, info.st_mtime_ns, info.st_ino
 
 
 def is_link(path: Path) -> bool:
@@ -28,21 +58,119 @@ def is_link(path: Path) -> bool:
     )
 
 
+def validate_root(root: Path) -> None:
+    if not root.is_dir() or is_link(root):
+        raise ValueError("媒体目录不可用，或已变为链接")
+    if any(is_link(parent) for parent in root.parents):
+        raise ValueError("媒体目录的父路径包含链接")
+
+
+def media_drives() -> list[Path]:
+    if os.name == "nt":
+        import ctypes
+
+        mask = ctypes.windll.kernel32.GetLogicalDrives()
+        if not mask:
+            raise OSError("无法读取本机磁盘列表")
+        return [Path(f"{chr(65 + index)}:\\") for index in range(26) if mask & (1 << index)]
+    return [Path(Path.cwd().anchor)]
+
+
 class FileService:
     def __init__(self, roots: list[Path], store: OperationStore):
         self.roots = roots
         self.store = store
         self.lock = RLock()
+        self.previews: dict[str, FilePreview] = {}
+
+    @property
+    def roots_version(self) -> str:
+        return sha256(json.dumps([str(root) for root in self.roots]).encode()).hexdigest()
+
+    def check_roots_version(self, version: str | None) -> None:
+        if version is not None and version != self.roots_version:
+            raise ValueError("媒体目录配置已变化，请刷新页面并重新预览")
+
+    def load_roots(self, settings: Settings) -> None:
+        with self.lock, self.store.sessions() as session:
+            saved = session.get(MediaRootSetting, 1)
+            if saved is not None:
+                roots = [Path(path) for path in saved.roots]
+                validate_media_targets(roots, settings.hosts_path, settings.log_path)
+                self.roots = roots
+
+    def browse_media_folders(self, path: str | None, settings: Settings) -> dict[str, Any]:
+        if not path:
+            return {
+                "path": None,
+                "parent": None,
+                "selectable": False,
+                "reason": "",
+                "entries": [
+                    {"name": str(drive), "path": str(drive), "blocked": False}
+                    for drive in media_drives()
+                ],
+            }
+        folder = Path(path)
+        if not folder.is_absolute():
+            raise ValueError("请选择本机绝对路径的文件夹")
+        validate_root(folder)
+        folder = folder.resolve()
+        entries = []
+        with os.scandir(folder) as children:
+            for index, child in enumerate(children):
+                if index >= 2000:
+                    raise ValueError("目录超过 2000 项，无法完整列出子文件夹")
+                info = child.stat(follow_symlinks=False)
+                blocked = stat.S_ISLNK(info.st_mode) or bool(
+                    getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+                )
+                if blocked or stat.S_ISDIR(info.st_mode):
+                    entries.append({"name": child.name, "path": child.path, "blocked": blocked})
+        reason = ""
+        try:
+            validate_media_targets([folder], settings.hosts_path, settings.log_path)
+        except ValueError as error:
+            reason = str(error)
+        return {
+            "path": str(folder),
+            "parent": str(folder.parent) if folder.parent != folder else None,
+            "entries": sorted(entries, key=lambda item: item["name"].casefold()),
+            "selectable": not reason,
+            "reason": reason,
+        }
+
+    def save_roots(self, request: MediaRootsUpdate, settings: Settings) -> dict[str, Any]:
+        with self.lock:
+            roots = []
+            for value in request.roots:
+                path = Path(value.strip()).expanduser()
+                if not path.is_absolute():
+                    raise ValueError("媒体目录必须填写本机绝对路径")
+                validate_root(path)
+                roots.append(path.resolve())
+            if len(set(roots)) != len(roots):
+                raise ValueError("媒体目录不能重复")
+            validate_media_targets(roots, settings.hosts_path, settings.log_path)
+
+            def apply() -> dict[str, Any]:
+                with self.store.sessions() as session:
+                    session.merge(MediaRootSetting(id=1, roots=[str(root) for root in roots]))
+                    session.commit()
+                self.roots = roots
+                self.previews.clear()
+                return {
+                    "roots": [{"id": index, "path": str(root)} for index, root in enumerate(roots)],
+                    "roots_version": self.roots_version,
+                }
+
+            return self.store.execute("media.roots.save", request.model_dump(), apply)
 
     def root(self, index: int) -> Path:
         if not 0 <= index < len(self.roots):
             raise ValueError("媒体目录不存在")
         root = self.roots[index]
-        if not root.is_dir() or is_link(root):
-            raise ValueError("媒体目录不可用，或已变为链接")
-        # Reject reparse points in ancestors as well, including Windows junctions.
-        if any(is_link(parent) for parent in root.parents):
-            raise ValueError("媒体目录的父路径包含链接")
+        validate_root(root)
         return root
 
     def resolve(self, index: int, relative: str, *, must_exist: bool = True) -> Path:
@@ -73,8 +201,9 @@ class FileService:
             raise FileNotFoundError("文件或目录不存在")
         return path
 
-    def list(self, root: int, relative: str) -> dict[str, Any]:
+    def list(self, root: int, relative: str, roots_version: str | None = None) -> dict[str, Any]:
         with self.lock:
+            self.check_roots_version(roots_version)
             directory = self.resolve(root, relative)
             if not directory.is_dir():
                 raise ValueError("请选择目录")
@@ -143,6 +272,7 @@ class FileService:
                 "destination": str(target) if target else None,
                 "size": info.st_size,
                 "modified_ns": info.st_mtime_ns,
+                "inode": info.st_ino,
                 "permanent": request.action == "delete",
             },
         )
@@ -181,9 +311,37 @@ class FileService:
 
     def execute(self, request: FileAction) -> dict[str, Any]:
         with self.lock:
+            self.check_roots_version(request.roots_version)
             _, _, plan = self._plan(request)
+            identity = request.model_dump(
+                exclude={"dry_run", "confirm_delete", "preview_id", "roots_version"}
+            )
             if request.dry_run:
-                return {"dry_run": True, **plan}
+                self.previews = {
+                    key: value
+                    for key, value in self.previews.items()
+                    if time.monotonic() - value.created < 1800
+                }
+                if len(self.previews) >= 50:
+                    raise ValueError("未执行的预览过多，请等待旧预览过期")
+                preview_id = uuid4().hex
+                self.previews[preview_id] = FilePreview(
+                    identity, plan, self.roots_version, operation_actor.get(), time.monotonic()
+                )
+                return {"dry_run": True, "preview_id": preview_id, **plan}
+
+            preview_id = request.preview_id or ""
+            preview = self.previews.get(preview_id)
+            if (
+                preview is None
+                or time.monotonic() - preview.created >= 1800
+                or preview.actor != operation_actor.get()
+                or preview.roots_version != self.roots_version
+                or preview.request != identity
+                or preview.plan != plan
+            ):
+                raise ValueError("缺少有效预览，或文件 / 操作已变化，请重新预览并确认")
+            del self.previews[preview_id]
 
             def apply() -> dict[str, Any]:
                 source, target, current = self._plan(request)

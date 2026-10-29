@@ -12,6 +12,7 @@ from sqlalchemy import (
     ForeignKey,
     MetaData,
     String,
+    UniqueConstraint,
     create_engine,
     select,
     text,
@@ -72,6 +73,76 @@ class LoginSession(Base):
         ForeignKey("mediaforge.users.id", ondelete="CASCADE"), index=True
     )
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class MetadataMapping(Base):
+    __tablename__ = "metadata_folder_mappings"
+    __table_args__ = (UniqueConstraint("media_type", "location_key"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    media_type: Mapped[str] = mapped_column(String(8))
+    root_path: Mapped[str] = mapped_column(String(2000))
+    folder_path: Mapped[str] = mapped_column(String(2000))
+    location_key: Mapped[str] = mapped_column(String(64))
+    tmdb_id: Mapped[int]
+
+
+class ScraperSetting(Base):
+    __tablename__ = "metadata_scraper_settings"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    api_key: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    priority: Mapped[int] = mapped_column(default=0)
+
+
+class MediaRootSetting(Base):
+    __tablename__ = "media_root_settings"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    roots: Mapped[list[str]] = mapped_column(JSON().with_variant(JSONB(), "postgresql"))
+
+
+class RenameRule(Base):
+    __tablename__ = "filename_rename_rules"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    name: Mapped[str] = mapped_column(String(80))
+    pattern: Mapped[str] = mapped_column(String(2000))
+    template: Mapped[str] = mapped_column(String(180))
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    priority: Mapped[int] = mapped_column(default=0)
+    default_season: Mapped[int] = mapped_column(default=1)
+
+
+class RenameDirectoryState(Base):
+    __tablename__ = "filename_rename_directories"
+
+    location_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    root_path: Mapped[str] = mapped_column(String(2000))
+    folder_path: Mapped[str] = mapped_column(String(2000))
+    fingerprint: Mapped[str] = mapped_column(String(64))
+    rules_version: Mapped[str] = mapped_column(String(64))
+    checked_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
+    )
+
+
+class VideoFileMetadata(Base):
+    __tablename__ = "video_file_metadata"
+
+    location_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    directory_key: Mapped[str] = mapped_column(String(64), index=True)
+    root_path: Mapped[str] = mapped_column(String(2000))
+    file_path: Mapped[str] = mapped_column(String(2000))
+    fingerprint: Mapped[list[int]] = mapped_column(JSON().with_variant(JSONB(), "postgresql"))
+    details: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"), nullable=True
+    )
+    error: Mapped[str | None] = mapped_column(String(2000), nullable=True)
+    scanned_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
+    )
 
 
 def make_engine(url: str):

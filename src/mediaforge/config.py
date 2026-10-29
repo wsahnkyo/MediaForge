@@ -19,6 +19,14 @@ def system_hosts_path() -> Path:
     return Path("/etc/hosts")
 
 
+def validate_media_targets(roots: list[Path], hosts_path: Path, log_path: Path) -> None:
+    for root in roots:
+        if hosts_path.resolve().is_relative_to(root):
+            raise ValueError("hosts 文件不能放在可操作的媒体目录中")
+        if log_path.resolve().is_relative_to(root):
+            raise ValueError("日志文件不能放在可操作的媒体目录中")
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="MEDIAFORGE_", env_file=".env", env_file_encoding="utf-8", extra="ignore"
@@ -26,6 +34,7 @@ class Settings(BaseSettings):
 
     database_url: SecretStr
     media_roots: list[Path] = Field(default_factory=list)
+    tmdb_api_key: SecretStr | None = None
     hosts_path: Path = Path("data/hosts.preview")
     hosts_allow_system: bool = False
     hosts_interval_seconds: int = Field(default=0, ge=0)
@@ -131,10 +140,5 @@ class Settings(BaseSettings):
         if self.hosts_path.resolve() == system_hosts_path().resolve():
             if not self.hosts_allow_system:
                 raise ValueError("修改系统 hosts 前必须设置 HOSTS_ALLOW_SYSTEM=true")
-        target = self.hosts_path.resolve()
-        for root in self.media_roots:
-            if target.is_relative_to(root):
-                raise ValueError("hosts 文件不能放在可操作的媒体目录中")
-            if self.log_path.resolve().is_relative_to(root):
-                raise ValueError("日志文件不能放在可操作的媒体目录中")
+        validate_media_targets(self.media_roots, self.hosts_path, self.log_path)
         return self
