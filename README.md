@@ -26,15 +26,33 @@ PostgreSQL 和 Vue 3。Vue 构建产物随 Python 提供，**运行时不需要 
 
 ## Windows 启动
 
-在仓库根目录执行：
+需要 Python 3.11+，**不要求已有 `.venv`**。以下命令均在仓库根目录执行，
+其中 `python` 指你选用的 Python 解释器；安装依赖和启动服务必须使用同一个环境。
+如果已经使用 Conda 或其他虚拟环境，激活后直接安装即可。
+
+### 选择环境（虚拟环境可选）
+
+推荐使用独立环境，避免影响其他项目。若尚无合适环境，可以创建并激活：
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e .
-Copy-Item .env.example .env
+.\.venv\Scripts\Activate.ps1
 ```
 
-如果已有 `.env`，不要覆盖。编辑其中的 PostgreSQL 连接：
+若 PowerShell 阻止运行激活脚本，无需修改执行策略；将后续命令中的 `python`
+替换为 `.\.venv\Scripts\python.exe` 即可。使用其他环境时，也可以替换为该环境的解释器完整路径。
+重新打开终端后，需要重新选择或激活同一个环境。
+
+### 安装与配置
+
+```powershell
+python -m pip install -e .
+if (-not (Test-Path .env)) {
+    Copy-Item .env.example .env
+}
+```
+
+已有 `.env` 会保留，不要覆盖。编辑其中的 PostgreSQL 连接：
 
 ```dotenv
 MEDIAFORGE_DATABASE_URL=postgresql+psycopg://mediaforge:CHANGE_ME@127.0.0.1:5432/mediaforge
@@ -47,15 +65,17 @@ MEDIAFORGE_HOSTS_INTERVAL_SECONDS=0
 数据库本身需已存在，账号需有连接、创建 schema 和创建表的权限。推荐使用专用数据库账号。
 凭据只放 `.env`，该文件已被 Git 忽略。
 
+### 初始化与启动
+
 ```powershell
 # 可单独执行；serve 启动时也会自动执行同一幂等初始化。
-.\.venv\Scripts\mediaforge.exe init-db
+python -m mediaforge.cli init-db
 
 # 交互输入密码，不回显；无默认账号密码。密码长度为 4–128 位。
-.\.venv\Scripts\mediaforge.exe create-admin --username admin
+python -m mediaforge.cli create-admin --username admin
 
 # 单进程启动，同时提供 API 和构建好的 Vue 页面。
-.\.venv\Scripts\mediaforge.exe serve
+python -m mediaforge.cli serve
 ```
 
 浏览器打开 **http://127.0.0.1:8765**。可用 `serve --port 8766` 修改端口。
@@ -66,7 +86,7 @@ MEDIAFORGE_HOSTS_INTERVAL_SECONDS=0
 忘记密码时执行：
 
 ```powershell
-.\.venv\Scripts\mediaforge.exe reset-password --username admin
+python -m mediaforge.cli reset-password --username admin
 ```
 
 重置密码会注销该用户全部旧会话。启动只监听 `127.0.0.1`，不会自动提权。
@@ -542,18 +562,20 @@ API 文档为 `/docs`。浏览器登录后的同源文档可携带 cookie；写�
 
 ## 开发检查
 
+使用与启动服务相同的 Python 环境，不限定虚拟环境名称或位置。
+
 ```powershell
-.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
-.\.venv\Scripts\ruff.exe check src tests
-.\.venv\Scripts\ruff.exe format --check src tests
-.\.venv\Scripts\pytest.exe -q
+python -m pip install -e ".[dev]"
+python -m ruff check src tests
+python -m ruff format --check src tests
+python -m pytest -q
 ```
 
 可选真实 PostgreSQL 测试，连接取自本地 `.env`：
 
 ```powershell
 $env:MEDIAFORGE_RUN_PG_TESTS = "1"
-.\.venv\Scripts\pytest.exe -q
+python -m pytest -q
 Remove-Item Env:\MEDIAFORGE_RUN_PG_TESTS
 ```
 
