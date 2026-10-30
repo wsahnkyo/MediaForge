@@ -2,13 +2,13 @@ import logging
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any, Literal
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
@@ -30,7 +30,14 @@ from mediaforge.database import (
     make_engine,
     operation_actor,
 )
-from mediaforge.files import FileAction, FileDeleteBatch, FileService, MediaRootsUpdate
+from mediaforge.emby import EmbyRefresh, EmbyService, EmbyUpdate
+from mediaforge.files import (
+    FileAction,
+    FileDeleteBatch,
+    FileMigration,
+    FileService,
+    MediaRootsUpdate,
+)
 from mediaforge.hosts import CHECKTMDB_URLS, HostsService
 from mediaforge.logs import LogService
 from mediaforge.metadata import (
@@ -52,6 +59,7 @@ from mediaforge.renaming import (
     RulesUpdate,
 )
 from mediaforge.scrapers import ScraperSettingsUpdate
+from mediaforge.tasks import TaskService
 from mediaforge.video_info import SCAN_INTERVAL_MINUTES, VideoInfoRequest, VideoInfoService
 
 logger = logging.getLogger(__name__)
@@ -61,6 +69,11 @@ WEB = Path(__file__).with_name("web")
 class HostsUpdate(BaseModel):
     dry_run: bool = True
     source: HostsSource | None = None
+
+
+class TaskSubmit(BaseModel):
+    kind: Literal["file.migrate", "video.info.scan", "metadata.apply", "rename.apply"]
+    request: dict[str, Any]
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -73,6 +86,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     metadata = MetadataService(settings, files, store)
     renaming = RenameService(files, store)
     video_info = VideoInfoService(files, store)
+    tasks = TaskService(store)
+    emby = EmbyService(store)
+    video_info.task_runner = lambda request: tasks.submit(
+        "video.info.scan",
+        request.model_dump(),
+        lambda: video_info.scan(request),
+        inline=True,
+    )
     hosts = HostsService(settings, store)
     logs = LogService(settings)
     scheduler = BackgroundScheduler()
@@ -82,6 +103,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             logs.start()
             initialize_database(engine)
+            tasks.recover()
             files.load_roots(settings)
             logger.info("MediaForge 启动，数据库初始化完成")
             if settings.hosts_interval_seconds:
@@ -107,6 +129,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         finally:
             if scheduler.running:
                 scheduler.shutdown(wait=True)
+            tasks.close()
             video_info.close()
             engine.dispose()
             logger.info("MediaForge 已停止")
@@ -121,6 +144,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.hosts = hosts
     app.state.auth = auth
     app.state.logs = logs
+    app.state.tasks = tasks
+    app.state.emby = emby
 
     @app.middleware("http")
     async def request_security(request: Request, call_next):
@@ -269,12 +294,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/config", dependencies=secured)
     def config():
-        with files.lock:
-            roots = [{"id": i, "path": str(root)} for i, root in enumerate(files.roots)]
-            roots_version = files.roots_version
         return {
-            "roots": roots,
-            "roots_version": roots_version,
+            **files.configuration(),
             "tmdb_key_configured": bool(metadata.scrapers.credential("tmdb")),
             "hosts_path": str(settings.hosts_path),
             "hosts_interval_seconds": settings.hosts_interval_seconds,
@@ -316,6 +337,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def delete_files(body: FileDeleteBatch):
         return files.delete_batch(body)
 
+    @app.get("/api/files/migration/source", dependencies=admin)
+    def migration_source(path: str = Query(min_length=1, max_length=2000)):
+        return files.migration_source(path, settings)
+
+    @app.post("/api/files/migration", dependencies=admin)
+    def migrate_files(body: FileMigration):
+        result = files.migrate(body, settings)
+        if not body.dry_run and result["moved_count"]:
+            video_info.request_scan()
+            return emby.after_change(result, True)
+        return result
+
     @app.get("/api/renaming/rules", dependencies=secured)
     def rename_rules():
         return [rule.model_dump() for rule in renaming.rules()]
@@ -345,7 +378,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         with files.lock:
             result = renaming.apply(body)
             metadata.previews.clear()
-            return result
+        return emby.after_change(result, result["renamed_count"] > 0)
 
     @app.post("/api/metadata/preview", dependencies=admin)
     def metadata_preview(body: MetadataPreview):
@@ -411,7 +444,95 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/metadata/apply", dependencies=admin)
     def metadata_apply(body: MetadataApply):
-        return metadata.apply(body)
+        result = metadata.apply(body)
+        return emby.after_change(
+            result, any(item["status"] == "success" for item in result["files"])
+        )
+
+    @app.get("/api/tasks", dependencies=secured)
+    def task_list():
+        return tasks.recent()
+
+    @app.get("/api/tasks/{task_id}", dependencies=secured)
+    def task_detail(task_id: str):
+        return tasks.get(task_id)
+
+    @app.post("/api/tasks/{task_id}/cancel", dependencies=admin)
+    def cancel_task(task_id: str):
+        return tasks.cancel(task_id)
+
+    @app.post("/api/tasks", dependencies=admin, status_code=202)
+    def submit_task(body: TaskSubmit):
+        try:
+            if body.kind == "file.migrate":
+                request = FileMigration.model_validate(body.request).model_copy(
+                    update={"dry_run": False}
+                )
+                return tasks.submit(body.kind, request.model_dump(), lambda: migrate_files(request))
+            if body.kind == "rename.apply":
+                rename_request = RenameApplyRequest.model_validate(body.request)
+                return tasks.submit(
+                    body.kind, rename_request.model_dump(), lambda: apply_renaming(rename_request)
+                )
+            if body.kind == "metadata.apply":
+                metadata_request = MetadataApply.model_validate(body.request)
+                return tasks.submit(
+                    body.kind,
+                    metadata_request.model_dump(),
+                    lambda: metadata_apply(metadata_request),
+                )
+            video_request = VideoInfoRequest.model_validate(body.request)
+            if not video_request.roots_version:
+                raise ValueError("视频扫描任务必须提供目录版本，请刷新页面")
+            return tasks.submit(
+                body.kind, video_request.model_dump(), lambda: video_info.scan(video_request)
+            )
+        except ValidationError:
+            raise ValueError("任务参数不正确，请重新预览或刷新页面") from None
+
+    @app.post("/api/tasks/video-scan-all", dependencies=admin, status_code=202)
+    def queue_all_video_scans():
+        with files.lock:
+            requests = [
+                VideoInfoRequest(root=index, roots_version=files.roots_version)
+                for index in range(len(files.roots))
+            ]
+        if not requests:
+            raise ValueError("请先配置媒体目录")
+        return {
+            "tasks": [
+                tasks.submit(
+                    "video.info.scan",
+                    request.model_dump(),
+                    lambda request=request: video_info.scan(request),
+                )
+                for request in requests
+            ]
+        }
+
+    @app.get("/api/emby", dependencies=admin)
+    def emby_configuration():
+        return emby.configuration()
+
+    @app.put("/api/emby", dependencies=admin)
+    def save_emby(body: EmbyUpdate):
+        return emby.save(body)
+
+    @app.delete("/api/emby/token", dependencies=admin)
+    def clear_emby_token():
+        return emby.clear_token()
+
+    @app.post("/api/emby/test", dependencies=admin)
+    def test_emby():
+        return emby.test_connection()
+
+    @app.get("/api/emby/libraries", dependencies=admin)
+    def emby_libraries():
+        return emby.libraries()
+
+    @app.post("/api/emby/refresh", dependencies=admin)
+    def refresh_emby(body: EmbyRefresh):
+        return emby.refresh(body)
 
     @app.post("/api/hosts/update", dependencies=secured)
     def update_hosts(body: HostsUpdate, user: Annotated[dict, Depends(current_user)]):

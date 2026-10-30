@@ -5,7 +5,13 @@ from pathlib import Path
 
 import pytest
 
-from mediaforge.files import FileAction, FileDeleteBatch, FileService, MediaRootsUpdate
+from mediaforge.files import (
+    FileAction,
+    FileDeleteBatch,
+    FileMigration,
+    FileService,
+    MediaRootsUpdate,
+)
 
 
 @pytest.fixture
@@ -27,6 +33,210 @@ def confirmed(files, request):
             }
         )
     )
+
+
+@pytest.fixture
+def downloads(tmp_path):
+    folder = tmp_path / "downloads"
+    folder.mkdir()
+    (folder / "new.mkv").write_bytes(b"new video")
+    (folder / "movie.mkv").write_bytes(b"downloaded duplicate")
+    (folder / "keep.srt").write_bytes(b"unselected subtitle")
+    (folder / "child").mkdir()
+    return folder
+
+
+def migration_request(files, downloads, **changes):
+    return FileMigration(
+        **{
+            "source_folder": str(downloads),
+            "paths": ["new.mkv", "movie.mkv"],
+            "target_root": 0,
+            "roots_version": files.roots_version,
+            **changes,
+        }
+    )
+
+
+def test_migration_cancellation_keeps_completed_moves_and_remaining_sources(
+    files, downloads, settings, monkeypatch
+):
+    request = migration_request(files, downloads)
+    preview = files.migrate(request, settings)
+    monkeypatch.setattr(
+        "mediaforge.files.task_progress", lambda completed, total, current: completed < 1
+    )
+    result = files.migrate(
+        request.model_copy(update={"dry_run": False, "preview_id": preview["preview_id"]}),
+        settings,
+    )
+    assert result["outcome"] == "cancelled"
+    assert result["moved_count"] == 1 and result["cancelled_count"] == 1
+    assert result["failed_count"] == 0
+    assert not (downloads / "new.mkv").exists()
+    assert (downloads / "movie.mkv").exists()
+    assert (files.roots[0] / "new.mkv").read_bytes() == b"new video"
+    assert (files.roots[0] / "movie.mkv").read_bytes() == b"movie"
+
+
+def test_migration_from_external_download_folder_skips_conflicts_and_audits(
+    files, downloads, settings
+):
+    listing = files.migration_source(str(downloads), settings)
+    assert listing["source_folder"] == str(downloads)
+    assert len(listing["entries"]) == 4
+    before_roots = files.roots.copy()
+    request = migration_request(files, downloads)
+    preview = files.migrate(request, settings)
+    assert preview["ready_count"] == 1 and preview["skipped_count"] == 1
+    assert (downloads / "new.mkv").exists()
+    assert not files.store.recent()
+    result = files.migrate(
+        request.model_copy(
+            update={
+                "dry_run": False,
+                "preview_id": preview["preview_id"],
+            }
+        ),
+        settings,
+    )
+    assert (result["moved_count"], result["skipped_count"], result["failed_count"]) == (1, 1, 0)
+    assert result["outcome"] == "partial"
+    assert not (downloads / "new.mkv").exists()
+    assert (files.roots[0] / "new.mkv").read_bytes() == b"new video"
+    assert (files.roots[0] / "movie.mkv").read_bytes() == b"movie"
+    assert (downloads / "movie.mkv").read_bytes() == b"downloaded duplicate"
+    assert (downloads / "keep.srt").exists() and (downloads / "child").is_dir()
+    assert files.roots == before_roots
+    assert files.store.get(result["operation_id"])["kind"] == "file.migrate"
+    assert preview["preview_id"] not in files.previews
+
+
+@pytest.mark.parametrize("kind", ["relative", "protected", "same", "child", "duplicate", "escape"])
+def test_migration_rejects_unsafe_sources_and_selections(files, downloads, settings, kind):
+    changes = {
+        "relative": {"source_folder": "downloads"},
+        "protected": {"source_folder": str(settings.hosts_path.parent)},
+        "same": {"source_folder": str(files.roots[0]), "paths": ["movie.mkv"]},
+        "child": {"paths": ["child"]},
+        "duplicate": {"paths": ["new.mkv", "new.mkv"]},
+        "escape": {"paths": ["../media/movie.mkv"]},
+    }[kind]
+    with pytest.raises((ValueError, OSError)):
+        files.migrate(migration_request(files, downloads, **changes), settings)
+    assert (downloads / "new.mkv").exists()
+    assert not (files.roots[0] / "new.mkv").exists()
+
+
+@pytest.mark.parametrize("change", ["file", "selection", "actor", "expired", "roots"])
+def test_migration_requires_unchanged_actor_bound_preview(files, downloads, settings, change):
+    request = migration_request(files, downloads)
+    preview = files.migrate(request, settings)
+    request = request.model_copy(update={"dry_run": False, "preview_id": preview["preview_id"]})
+    if change == "file":
+        (downloads / "new.mkv").write_bytes(b"still downloading")
+    elif change == "selection":
+        request = request.model_copy(update={"paths": ["new.mkv"]})
+    elif change == "actor":
+        files.previews[preview["preview_id"]].actor = "another-admin"
+    elif change == "expired":
+        files.previews[preview["preview_id"]].created -= 1801
+    else:
+        files.save_roots(MediaRootsUpdate(roots=[]), settings)
+    with pytest.raises(ValueError):
+        files.migrate(request, settings)
+    assert (downloads / "new.mkv").exists()
+
+
+def test_migration_new_conflict_is_skipped_and_preview_skips_stay_skipped(
+    files, downloads, settings
+):
+    request = migration_request(files, downloads, paths=["new.mkv", "movie.mkv", "keep.srt"])
+    preview = files.migrate(request, settings)
+    (files.roots[0] / "new.mkv").write_bytes(b"created after preview")
+    (files.roots[0] / "movie.mkv").unlink()
+    result = files.migrate(
+        request.model_copy(
+            update={
+                "dry_run": False,
+                "preview_id": preview["preview_id"],
+            }
+        ),
+        settings,
+    )
+    assert result["moved_count"] == 1 and result["skipped_count"] == 2
+    assert (files.roots[0] / "new.mkv").read_bytes() == b"created after preview"
+    assert (downloads / "new.mkv").exists() and (downloads / "movie.mkv").exists()
+    assert (files.roots[0] / "keep.srt").read_bytes() == b"unselected subtitle"
+
+
+def test_migration_reports_partial_failures_and_never_replays(
+    files, downloads, settings, monkeypatch
+):
+    request = migration_request(files, downloads, paths=["new.mkv", "keep.srt"])
+    preview = files.migrate(request, settings)
+    move = files._move
+
+    def fail_one(source, target):
+        if source.name == "new.mkv":
+            raise PermissionError("test file locked")
+        move(source, target)
+
+    monkeypatch.setattr(files, "_move", fail_one)
+    request = request.model_copy(update={"dry_run": False, "preview_id": preview["preview_id"]})
+    result = files.migrate(request, settings)
+    assert result["moved_count"] == 1 and result["failed_count"] == 1
+    assert result["files"][0]["error"] == "test file locked"
+    assert files.store.get(result["operation_id"])["status"] == "partial"
+    assert (downloads / "new.mkv").exists()
+    (files.roots[0] / "keep.srt").rename(downloads / "keep.srt")
+    with pytest.raises(ValueError, match="预览"):
+        files.migrate(request, settings)
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_cross_volume_migration_preserves_source_if_download_changes(
+    files, downloads, settings, monkeypatch, changed
+):
+    request = migration_request(files, downloads, paths=["new.mkv"])
+    preview = files.migrate(request, settings)
+
+    def cross_device(*args):
+        raise OSError(errno.EXDEV, "cross-device")
+
+    if os.name == "nt":
+        monkeypatch.setattr(Path, "rename", cross_device)
+    else:
+        monkeypatch.setattr(os, "link", cross_device)
+    from mediaforge import files as files_module
+
+    copy = files_module.shutil.copyfileobj
+
+    def copy_and_change(reader, writer, **kwargs):
+        copy(reader, writer, **kwargs)
+        if changed:
+            with (downloads / "new.mkv").open("ab") as source:
+                source.write(b"more downloaded bytes")
+
+    monkeypatch.setattr(files_module.shutil, "copyfileobj", copy_and_change)
+    result = files.migrate(
+        request.model_copy(
+            update={
+                "dry_run": False,
+                "preview_id": preview["preview_id"],
+            }
+        ),
+        settings,
+    )
+    if changed:
+        assert result["outcome"] == "failed"
+        assert "复制期间发生变化" in result["files"][0]["error"]
+        assert (downloads / "new.mkv").read_bytes() == b"new videomore downloaded bytes"
+        assert not (files.roots[0] / "new.mkv").exists()
+    else:
+        assert result["outcome"] == "success"
+        assert not (downloads / "new.mkv").exists()
+        assert (files.roots[0] / "new.mkv").read_bytes() == b"new video"
 
 
 def test_batch_delete_preview_execution_and_audit(files, store):
@@ -448,6 +658,8 @@ def test_reject_windows_junction_without_following_target(files, tmp_path, setti
         assert next(item for item in listing["entries"] if item["name"] == "junction")["blocked"]
         with pytest.raises(ValueError, match="链接"):
             files.browse_media_folders(str(junction), settings)
+        with pytest.raises(ValueError, match="链接"):
+            files.migration_source(str(junction), settings)
         with pytest.raises(ValueError, match="链接"):
             files.save_roots(
                 MediaRootsUpdate(roots=[str(junction)]),

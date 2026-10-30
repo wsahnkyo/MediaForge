@@ -31,6 +31,7 @@ from mediaforge.scrapers import (
     ScraperUpdate,
     fill_missing,
 )
+from mediaforge.tasks import task_progress
 
 logger = logging.getLogger(__name__)
 MediaType = Literal["tv", "movie"]
@@ -998,9 +999,14 @@ class MetadataService:
             for item in preview.artifacts:
                 self._validate_artifact(root, item)
         results = []
-        for item in preview.artifacts:
+        cancelled = False
+        for index, item in enumerate(preview.artifacts):
             result: dict[str, Any] = {"path": item.path, "status": "failed"}
             results.append(result)
+            if cancelled or not task_progress(index, len(preview.artifacts), item.path):
+                cancelled = True
+                result.update(status="cancelled", error="任务已取消，未写入")
+                continue
             try:
                 with self.files.lock:
                     self._check_preview(preview_id, preview)
@@ -1022,7 +1028,9 @@ class MetadataService:
         return {
             "files": results,
             "rows": preview.rows,
-            "outcome": ("success" if success == len(results) and not issues else "partial")
+            "outcome": "cancelled"
+            if cancelled
+            else ("success" if success == len(results) and not issues else "partial")
             if success
             else "failed",
         }

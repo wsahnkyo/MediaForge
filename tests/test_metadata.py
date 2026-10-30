@@ -113,6 +113,20 @@ def metadata(settings, store, monkeypatch):
     return service
 
 
+def test_cancellation_keeps_written_artifacts_and_skips_remaining(metadata, monkeypatch):
+    preview = metadata.preview(MetadataPreview(root=0, path="示例剧 (2020)", api_key=KEY))
+    monkeypatch.setattr(
+        "mediaforge.metadata.task_progress",
+        lambda completed, total, current: completed < 1,
+    )
+    result = metadata.apply(MetadataApply(preview_id=preview["preview_id"], api_key=KEY))
+    assert result["outcome"] == "cancelled"
+    assert sum(item["status"] == "success" for item in result["files"]) == 1
+    assert all(item["status"] == "cancelled" for item in result["files"][1:])
+    assert len(list(metadata.files.roots[0].rglob("*.nfo"))) == 1
+    assert not list(metadata.files.roots[0].rglob("*.jpg"))
+
+
 def test_preview_and_write_emby_series_episodes_and_artwork(metadata):
     preview = metadata.preview(MetadataPreview(root=0, path="示例剧 (2020)", api_key=KEY))
     assert preview["file_count"] == 5

@@ -35,6 +35,26 @@ def apply(renaming, report):
     return renaming.apply(RenameApplyRequest(preview_id=report["preview_id"]))
 
 
+def test_cancellation_finishes_whole_group_and_does_not_checkpoint_directory(renaming, monkeypatch):
+    for extension in ("mkv", "srt", "nfo"):
+        add(renaming, f"Show.EP01.{extension}")
+    second = add(renaming, "Show.EP02.mkv")
+
+    def progress(completed, total, current):
+        if completed:
+            assert all(
+                (renaming.files.roots[0] / f"01.{ext}").exists() for ext in ("mkv", "srt", "nfo")
+            )
+            return False
+        return True
+
+    monkeypatch.setattr("mediaforge.renaming.task_progress", progress)
+    result = apply(renaming, preview(renaming))
+    assert result["outcome"] == "cancelled" and result["renamed_count"] == 1
+    assert second.exists()
+    assert not preview(renaming)["unchanged"]
+
+
 @pytest.mark.parametrize(
     "filename,expected",
     [

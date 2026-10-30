@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from fractions import Fraction
@@ -22,6 +23,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from mediaforge.database import OperationStore, VideoFileMetadata
 from mediaforge.files import FileService, signature
 from mediaforge.metadata import VIDEO_EXTENSIONS
+from mediaforge.tasks import task_progress
 
 logger = logging.getLogger(__name__)
 FORMAT_WHITELIST = "matroska,webm,mov,mp4,m4a,3gp,3g2,mj2,avi,mpegts,mpeg,asf,flv"
@@ -207,6 +209,7 @@ class VideoInfoService:
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="video-info")
         self.pending = False
         self.closing = False
+        self.task_runner: Callable[[VideoInfoRequest], dict[str, Any]] | None = None
         self.state: dict[str, Any] = {
             "running": False,
             "current": "",
@@ -262,8 +265,9 @@ class VideoInfoService:
                             break
                         self.state["current"] = str(root)
                     try:
-                        result = self.scan(
-                            VideoInfoRequest(root=index, roots_version=roots_version)
+                        request = VideoInfoRequest(root=index, roots_version=roots_version)
+                        result = (
+                            self.task_runner(request) if self.task_runner else self.scan(request)
                         )
                     except (OSError, ValueError) as exc:
                         logger.warning("视频识别目录不可用 root=%s: %s", root, exc)
@@ -271,7 +275,13 @@ class VideoInfoService:
                         summary["failed"] += 1
                         continue
                     for key in summary:
-                        summary[key] += result[key]
+                        summary[key] += result.get(key, 0)
+                    if result.get("error"):
+                        errors.append(str(result["error"]))
+                        if not result.get("failed"):
+                            summary["failed"] += 1
+                    if result.get("outcome") == "cancelled":
+                        break
                 with self.lock:
                     self.state.update(
                         summary=summary,
@@ -447,7 +457,11 @@ class VideoInfoService:
                 )
             }
         pending: list[VideoFileMetadata] = []
+        cancelled = False
         for index, item in enumerate(entries):
+            if not task_progress(index, len(entries), str(folder / item["name"])):
+                cancelled = True
+                break
             remaining = 120 - (time.monotonic() - started)
             if remaining < 1:
                 summary["deferred"] += len(entries) - index
@@ -512,5 +526,9 @@ class VideoInfoService:
             self._save_batch(request, pending, summary)
         return {
             **summary,
-            "outcome": "partial" if summary["failed"] or summary["deferred"] else "success",
+            "outcome": "cancelled"
+            if cancelled
+            else "partial"
+            if summary["failed"] or summary["deferred"]
+            else "success",
         }

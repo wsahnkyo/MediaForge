@@ -16,6 +16,100 @@ from mediaforge.video_info import VideoInfoService
 HEADERS = {"X-MediaForge-Request": "1"}
 
 
+def test_task_and_emby_permissions(client):
+    routes = [
+        ("POST", "/api/tasks", {"kind": "video.info.scan", "request": {"root": 0}}),
+        ("POST", "/api/tasks/missing/cancel", {}),
+        ("POST", "/api/tasks/video-scan-all", {}),
+        ("PUT", "/api/emby", {"server_url": "http://emby.invalid"}),
+        ("DELETE", "/api/emby/token", None),
+        ("POST", "/api/emby/test", {}),
+        ("POST", "/api/emby/refresh", {}),
+    ]
+    assert client.get("/api/tasks").status_code == 401
+    for method, path, body in routes:
+        assert client.request(method, path, json=body, headers=HEADERS).status_code == 401
+    login(client, "viewer", "viewer-password-123")
+    assert client.get("/api/tasks").status_code == 200
+    assert client.get("/api/emby").status_code == 403
+    assert client.get("/api/emby/libraries").status_code == 403
+    for method, path, body in routes:
+        assert client.request(method, path, json=body, headers=HEADERS).status_code == 403
+    login(client)
+    for method, path, body in routes:
+        assert client.request(method, path, json=body).status_code == 403
+
+
+def test_migration_task_preserves_actor_and_runs_emby_hook(client, tmp_path):
+    login(client)
+    source = tmp_path / "downloads"
+    source.mkdir()
+    (source / "download.mkv").write_bytes(b"download")
+    root = client.app.state.files.roots[0]
+    root.mkdir()
+    calls = []
+    client.app.state.emby.transport = httpx.MockTransport(
+        lambda request: calls.append(request) or httpx.Response(204)
+    )
+    configured = client.put(
+        "/api/emby",
+        headers=HEADERS,
+        json={
+            "server_url": "http://emby.invalid/emby",
+            "api_token": "fixture-token",
+            "auto_refresh": True,
+        },
+    )
+    assert configured.status_code == 200 and "fixture-token" not in configured.text
+    payload = {
+        "source_folder": str(source),
+        "paths": ["download.mkv"],
+        "target_root": 0,
+        "roots_version": client.app.state.files.roots_version,
+    }
+    preview = client.post("/api/files/migration", json=payload, headers=HEADERS).json()
+    payload.update(preview_id=preview["preview_id"], dry_run=False)
+    response = client.post(
+        "/api/tasks", headers=HEADERS, json={"kind": "file.migrate", "request": payload}
+    )
+    assert response.status_code == 202
+    task_id = response.json()["id"]
+    client.app.state.tasks.executor.submit(lambda: None).result(timeout=5)
+    detail = client.get(f"/api/tasks/{task_id}").json()
+    assert detail["actor"] == "admin" and detail["status"] == "success"
+    assert detail["result"]["moved_count"] == 1
+    assert detail["result"]["emby_refresh"]["accepted"]
+    assert len(calls) == 1 and calls[0].url.path == "/emby/Library/Refresh"
+    duplicate = client.post(
+        "/api/tasks", headers=HEADERS, json={"kind": "file.migrate", "request": payload}
+    )
+    assert duplicate.json()["id"] == task_id and len(calls) == 1
+    assert not (source / "download.mkv").exists()
+    assert (root / "download.mkv").read_bytes() == b"download"
+
+
+def test_config_snapshot_remains_responsive_while_files_are_locked(client):
+    login(client)
+    entered, release = Event(), Event()
+
+    def blocking():
+        with client.app.state.files.lock:
+            entered.set()
+            assert release.wait(5)
+        return {}
+
+    try:
+        client.app.state.tasks.submit("file.migrate", {}, blocking)
+        assert entered.wait(5)
+        response = client.get("/api/config")
+        assert response.status_code == 200
+        assert response.json()["roots_version"] == client.app.state.files.roots_version
+        assert client.get("/api/tasks").json()[0]["status"] == "running"
+    finally:
+        release.set()
+    client.app.state.tasks.executor.submit(lambda: None).result(timeout=5)
+
+
 def test_immediate_mutation_routes_require_admin_and_same_origin_header(client):
     routes = [
         (
@@ -36,6 +130,45 @@ def test_immediate_mutation_routes_require_admin_and_same_origin_header(client):
     assert login(client).status_code == 200
     for method, path, body in routes:
         assert client.request(method, path, json=body).status_code == 403
+
+
+def test_migration_api_permissions_external_source_and_persistence(client, tmp_path):
+    source = tmp_path / "downloads"
+    source.mkdir()
+    (source / "download.mkv").write_bytes(b"download")
+    root = client.app.state.files.roots[0]
+    root.mkdir()
+    listing_path = "/api/files/migration/source"
+    payload = {
+        "source_folder": str(source),
+        "paths": ["download.mkv"],
+        "target_root": 0,
+        "roots_version": client.app.state.files.roots_version,
+    }
+    assert client.get(listing_path, params={"path": str(source)}).status_code == 401
+    assert client.post("/api/files/migration", json=payload, headers=HEADERS).status_code == 401
+    assert login(client, "viewer", "viewer-password-123").status_code == 200
+    assert client.get(listing_path, params={"path": str(source)}).status_code == 403
+    assert client.post("/api/files/migration", json=payload, headers=HEADERS).status_code == 403
+    assert login(client).status_code == 200
+    listing = client.get(listing_path, params={"path": str(source)})
+    assert listing.status_code == 200 and listing.json()["entries"][0]["name"] == "download.mkv"
+    assert client.post("/api/files/migration", json=payload).status_code == 403
+    preview = client.post("/api/files/migration", json=payload, headers=HEADERS)
+    assert preview.status_code == 200 and preview.json()["ready_count"] == 1
+    response = client.post(
+        "/api/files/migration",
+        headers=HEADERS,
+        json={
+            **payload,
+            "dry_run": False,
+            "preview_id": preview.json()["preview_id"],
+        },
+    )
+    assert response.status_code == 200 and response.json()["moved_count"] == 1
+    assert not (source / "download.mkv").exists()
+    assert (root / "download.mkv").read_bytes() == b"download"
+    assert [item["path"] for item in client.get("/api/config").json()["roots"]] == [str(root)]
 
 
 def test_immediate_crud_routes_persist_changes_and_preserve_legacy_endpoints(client):

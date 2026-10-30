@@ -13,6 +13,7 @@ from sqlalchemy import event, select
 from mediaforge import video_info
 from mediaforge.database import VideoFileMetadata
 from mediaforge.files import FileService
+from mediaforge.tasks import TaskService
 from mediaforge.video_info import VideoInfoRequest, VideoInfoService, normalize
 
 
@@ -63,6 +64,50 @@ def info(settings, store, monkeypatch):
         yield service
     finally:
         service.close()
+
+
+def test_cancel_scan_flushes_completed_cache_batch(info, monkeypatch):
+    add_video(info.files.roots[0], "01.mkv")
+    add_video(info.files.roots[0], "02.mkv")
+    monkeypatch.setattr(
+        video_info,
+        "task_progress",
+        lambda completed, total, current: completed < 1,
+    )
+    result = info.scan(VideoInfoRequest(root=0))
+    assert result["outcome"] == "cancelled" and result["analyzed"] == 1
+    assert len(info.calls) == 1
+    rows = info.listing(VideoInfoRequest(root=0))["rows"]
+    assert rows[0]["status"] == "saved" and rows[1]["status"] != "saved"
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_automatic_scan_records_persistent_task_and_reports_errors(info, monkeypatch, fail):
+    add_video(info.files.roots[0])
+    tasks = TaskService(info.store)
+
+    def rejected(request):
+        raise ValueError("fixture rejected")
+
+    if fail:
+        monkeypatch.setattr(info, "scan", rejected)
+    info.task_runner = lambda request: tasks.submit(
+        "video.info.scan",
+        request.model_dump(),
+        lambda: info.scan(request),
+        inline=True,
+    )
+    try:
+        info.request_scan()
+        info.executor.submit(lambda: None).result(timeout=5)
+        task = tasks.recent()[0]
+        assert task["kind"] == "video.info.scan" and task["actor"] == "scheduler"
+        assert task["status"] == ("failed" if fail else "success")
+        status = info.status()
+        assert status["summary"]["failed" if fail else "analyzed"] == 1
+        assert ("fixture rejected" in status["error"]) == fail
+    finally:
+        tasks.close()
 
 
 def test_automatic_all_roots_direct_only_cache_persists_across_restart(info):

@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 
 from mediaforge.config import Settings, validate_media_targets
 from mediaforge.database import MediaRootSetting, OperationStore, operation_actor
+from mediaforge.tasks import task_progress
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,17 @@ class FileAction(BaseModel):
     dry_run: bool = True
     confirm_delete: str | None = None
     roots_version: str | None = None
+    preview_id: str | None = None
+
+
+class FileMigration(BaseModel):
+    source_folder: str = Field(min_length=1, max_length=2000)
+    paths: list[Annotated[str, Field(min_length=1, max_length=255)]] = Field(
+        min_length=1, max_length=1000
+    )
+    target_root: int = Field(ge=0)
+    roots_version: str = Field(min_length=1, max_length=64)
+    dry_run: bool = True
     preview_id: str | None = None
 
 
@@ -100,6 +112,14 @@ class FileService:
     @property
     def roots_version(self) -> str:
         return sha256(json.dumps([str(root) for root in self.roots]).encode()).hexdigest()
+
+    def configuration(self) -> dict[str, Any]:
+        # Root updates replace the list atomically; keep paths/version on the same snapshot.
+        paths = [str(root) for root in self.roots]
+        return {
+            "roots": [{"id": index, "path": path} for index, path in enumerate(paths)],
+            "roots_version": sha256(json.dumps(paths).encode()).hexdigest(),
+        }
 
     def check_roots_version(self, version: str | None) -> None:
         if version is not None and version != self.roots_version:
@@ -294,6 +314,7 @@ class FileService:
 
     @staticmethod
     def _move(source: Path, target: Path) -> None:
+        before = signature(source)
         try:
             if os.name == "nt":
                 # Windows rename is no-replace and preserves the file without copying.
@@ -314,8 +335,10 @@ class FileService:
                     target.unlink()
                     raise
             try:
+                if signature(source) != before:
+                    raise ValueError("源文件在复制期间发生变化，已保留源文件，请等待下载完成")
                 shutil.copystat(source, target)
-            except OSError:
+            except (OSError, ValueError):
                 target.unlink()
                 raise
         try:
@@ -395,6 +418,127 @@ class FileService:
                 }
 
             return self.store.execute("file.delete.batch", request.model_dump(), apply)
+
+    def _migration_source(self, folder: str, settings: Settings) -> "FileService":
+        path = Path(folder)
+        if not path.is_absolute():
+            raise ValueError("请选择下载目录的绝对路径")
+        validate_root(path)
+        path = path.resolve()
+        validate_media_targets([path], settings.hosts_path, settings.log_path)
+        return FileService([path], self.store)
+
+    def migration_source(self, folder: str, settings: Settings) -> dict[str, Any]:
+        with self.lock:
+            source = self._migration_source(folder, settings)
+            return {**source.list(0, ""), "source_folder": str(source.roots[0])}
+
+    def migrate(self, request: FileMigration, settings: Settings) -> dict[str, Any]:
+        with self.lock:
+            self.check_roots_version(request.roots_version)
+            source_files = self._migration_source(request.source_folder, settings)
+            target_root = self.root(request.target_root)
+            if source_files.roots[0] == target_root:
+                raise ValueError("下载目录和目标媒体目录不能相同")
+            plans = []
+            skipped = {}
+            for name in request.paths:
+                if "/" in name or "\\" in name:
+                    raise ValueError("只能迁移下载目录直属文件，不迁移子目录")
+                _, _, source_plan = source_files._plan(
+                    FileAction(action="delete", root=0, path=name)
+                )
+                target = self.resolve(request.target_root, name, must_exist=False)
+                plans.append(
+                    {
+                        **source_plan,
+                        "action": "move",
+                        "permanent": False,
+                        "path": name,
+                        "destination": str(target),
+                    }
+                )
+                if target.exists():
+                    skipped[name] = "目标已存在，跳过且不覆盖"
+            if len({os.path.normcase(plan["source"]) for plan in plans}) != len(plans):
+                raise ValueError("不能重复选择同一个文件")
+            identity = {
+                "action": "file-migration",
+                **request.model_dump(exclude={"dry_run", "preview_id", "roots_version"}),
+            }
+            if request.dry_run:
+                preview = self._remember_preview(identity, {"files": plans, "skipped": skipped})
+                return {
+                    **preview,
+                    "files": [
+                        {
+                            **plan,
+                            "status": "skipped" if plan["path"] in skipped else "ready",
+                            "error": skipped.get(plan["path"]),
+                        }
+                        for plan in plans
+                    ],
+                    "ready_count": len(plans) - len(skipped),
+                    "skipped_count": len(skipped),
+                }
+            preview = self.previews.get(request.preview_id or "")
+            skipped = preview.plan.get("skipped", {}) if preview else {}
+            self._consume_preview(
+                request.preview_id, identity, {"files": plans, "skipped": skipped}
+            )
+
+            def apply() -> dict[str, Any]:
+                results = []
+                cancelled = False
+                for index, plan in enumerate(plans):
+                    name = plan["path"]
+                    row = {
+                        "path": name,
+                        "source": plan["source"],
+                        "destination": plan["destination"],
+                        "status": "failed",
+                        "error": None,
+                    }
+                    results.append(row)
+                    if cancelled or not task_progress(index, len(plans), name):
+                        cancelled = True
+                        row.update(status="cancelled", error="任务已取消，未迁移")
+                        continue
+                    if name in skipped:
+                        row.update(status="skipped", error=skipped[name])
+                        continue
+                    try:
+                        source = source_files.resolve(0, name)
+                        target = self.resolve(request.target_root, name, must_exist=False)
+                        if signature(source) != (plan["size"], plan["modified_ns"], plan["inode"]):
+                            raise ValueError("源文件在确认后发生变化，未迁移")
+                        if target.exists():
+                            raise FileExistsError("目标已存在，跳过且不覆盖")
+                        self._move(source, target)
+                        row["status"] = "success"
+                    except FileExistsError as exc:
+                        row.update(status="skipped", error=str(exc))
+                    except (OSError, ValueError) as exc:
+                        row["error"] = str(exc)
+                        logger.warning("文件迁移失败 path=%s: %s", name, exc)
+                moved = sum(row["status"] == "success" for row in results)
+                skipped_count = sum(row["status"] == "skipped" for row in results)
+                return {
+                    "files": results,
+                    "moved_count": moved,
+                    "skipped_count": skipped_count,
+                    "failed_count": sum(row["status"] == "failed" for row in results),
+                    "cancelled_count": sum(row["status"] == "cancelled" for row in results),
+                    "outcome": "cancelled"
+                    if cancelled
+                    else "success"
+                    if moved == len(results)
+                    else "partial"
+                    if moved or skipped_count
+                    else "failed",
+                }
+
+            return self.store.execute("file.migrate", request.model_dump(), apply)
 
     def execute(self, request: FileAction) -> dict[str, Any]:
         with self.lock:

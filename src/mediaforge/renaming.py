@@ -18,6 +18,7 @@ from sqlalchemy import delete, select
 from mediaforge.database import OperationStore, RenameDirectoryState, RenameRule, operation_actor
 from mediaforge.files import FileService, signature
 from mediaforge.metadata import EXTRA_SUFFIX, MULTI_EPISODE, VIDEO_EXTENSIONS
+from mediaforge.tasks import task_progress
 
 logger = logging.getLogger(__name__)
 SIDECARS = {".nfo", ".srt", ".ass", ".ssa", ".vtt", ".sub", ".idx"}
@@ -498,8 +499,13 @@ class RenameService:
     def _apply(self, plan: RenamePlan) -> dict[str, Any]:
         rows = deepcopy(plan.rows)
         failed = False
-        for row in rows:
+        cancelled = False
+        for index, row in enumerate(rows):
             if row["status"] != "ready":
+                continue
+            if cancelled or not task_progress(index, len(rows), row["source"]):
+                cancelled = True
+                row.update(status="cancelled", reason="任务已取消，未重命名")
                 continue
             completed = []
             try:
@@ -531,12 +537,14 @@ class RenameService:
                     except (OSError, ValueError) as rollback_error:
                         row["rollback_errors"].append(f"{item['target']}：{rollback_error}")
                 logger.warning("重命名失败 path=%s: %s", row["source"], error)
-        if not failed and not any(row["status"] == "conflict" for row in rows):
+        if not cancelled and not failed and not any(row["status"] == "conflict" for row in rows):
             self._checkpoint(plan, self._listing(plan.request)[1])
         return {
             "rows": rows,
             "renamed_count": sum(row["status"] == "renamed" for row in rows),
-            "outcome": "partial"
+            "outcome": "cancelled"
+            if cancelled
+            else "partial"
             if failed or any(row["status"] == "conflict" for row in rows)
             else "success",
         }

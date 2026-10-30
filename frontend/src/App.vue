@@ -2,6 +2,28 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 
 type HostsSource = "dns" | "checktmdb";
+interface BackgroundTask {
+  id: string; kind: string; actor: string; status: string;
+  completed: number; total: number; current: string; cancel_requested: boolean;
+  error: string | null; created_at: string; finished_at: string | null;
+  request?: Record<string, unknown>; result?: Record<string, unknown> | null;
+}
+interface EmbyConfiguration { server_url: string; configured: boolean; auto_refresh: boolean }
+const taskRecords = ref<BackgroundTask[]>([]);
+const taskDetail = ref<BackgroundTask | null>(null);
+const taskDetailId = ref("");
+const taskError = ref("");
+const taskLoading = ref(false);
+const taskCancelling = ref("");
+const taskNames: Record<string, string> = { "file.migrate": "文件迁移", "video.info.scan": "视频扫描", "metadata.apply": "影视刮削", "rename.apply": "批量重命名" };
+const taskStatuses: Record<string, string> = { queued: "排队中", running: "执行中", success: "成功", partial: "部分成功", failed: "失败", cancelled: "已取消", interrupted: "重启中断 / 待核对" };
+let taskGeneration = 0;
+let taskTimer: ReturnType<typeof setTimeout> | undefined;
+const embySaved = ref<EmbyConfiguration>({ server_url: "", configured: false, auto_refresh: false });
+const embyForm = ref({ server_url: "", api_token: "", auto_refresh: false });
+const embyLibraries = ref<{ id: string; name: string }[]>([]);
+const embyLibrary = ref("");
+const embyDirty = computed(() => embyForm.value.server_url.trim().replace(/\/+$/, "") !== embySaved.value.server_url || !!embyForm.value.api_token || embyForm.value.auto_refresh !== embySaved.value.auto_refresh);
 const sourceNames: Record<HostsSource, string> = {
   dns: "本机 DNS 查询 + TLS 测速",
   checktmdb: "CheckTMDB 订阅（IPv4 + IPv6）",
@@ -89,6 +111,24 @@ interface DeleteFilesResult {
   deleted_count: number;
   outcome: "success" | "partial" | "failed";
   files: { path: string; status: "success" | "failed"; error: string | null }[];
+}
+interface MigrationRequest {
+  source_folder: string;
+  paths: string[];
+  target_root: number;
+  roots_version: string;
+  preview_id?: string;
+}
+interface MigrationRow {
+  path: string; source: string; destination: string;
+  status: "ready" | "success" | "skipped" | "failed"; error: string | null;
+}
+interface MigrationPreview {
+  preview_id: string; files: MigrationRow[]; ready_count: number; skipped_count: number;
+}
+interface MigrationResult {
+  files: MigrationRow[]; moved_count: number; skipped_count: number; failed_count: number;
+  outcome: "success" | "partial" | "failed";
 }
 interface RenameRule {
   id: string; name: string; pattern: string; template: string;
@@ -236,15 +276,17 @@ const selectedRootPaths = ref<string[]>([]);
 const mediaFolderListing = ref<MediaFolderListing | null>(null);
 const mediaFolderError = ref("");
 const mediaFolderDialog = ref<HTMLDialogElement | null>(null);
+const folderPickerPurpose = ref<"root" | "migration">("root");
 const mediaFolderAlreadyAdded = computed(() => mediaFolderListing.value?.path
   ? mediaRootsDraft.value.some(path => path === mediaFolderListing.value?.path) : false);
-const workspaceTabs = ["dashboard", "configuration", "files", "renaming", "hosts", "operations", "logs", "users", "settings", "downloads", "metadata", "video-info"] as const;
+const workspaceTabs = ["dashboard", "configuration", "files", "migration", "tasks", "renaming", "hosts", "operations", "logs", "users", "settings", "downloads", "metadata", "video-info"] as const;
 const tab = ref<typeof workspaceTabs[number]>("dashboard");
 const configurationSections = [
   { id: "roots", name: "媒体目录" },
   { id: "renaming", name: "命名规则" },
   { id: "scrapers", name: "刮削器" },
   { id: "mappings", name: "影视匹配" },
+  { id: "emby", name: "Emby 联动" },
   { id: "downloaders", name: "下载器（预留）" },
   { id: "system", name: "系统配置" },
 ] as const;
@@ -252,12 +294,14 @@ const configurationSection = ref<typeof configurationSections[number]["id"]>("ro
 const pageInfo = {
   dashboard: { title: "工作台", group: "概览", description: "媒体库状态与常用工具，一目了然。" },
   files: { title: "文件浏览", group: "媒体工具", description: "浏览媒体目录，整理文件与存放位置。" },
+  migration: { title: "文件迁移", group: "媒体工具", description: "将下载目录中的文件移入媒体库，保留文件名，不覆盖已有文件。" },
   renaming: { title: "批量重命名", group: "媒体工具", description: "按规则统一命名，核对预览后再执行。" },
   metadata: { title: "影视刮削", group: "媒体工具", description: "匹配影视资料，为媒体补全 NFO 与海报。" },
   "video-info": { title: "视频分析", group: "媒体工具", description: "从编码、码率到音轨，了解视频与播放风险。" },
   configuration: { title: "配置管理", group: "管理", description: "集中管理媒体目录、命名规则与刮削配置。" },
   hosts: { title: "Hosts 更新", group: "系统工具", description: "检测域名连通性，预览并更新本机 Hosts。" },
   operations: { title: "操作记录", group: "系统工具", description: "追踪操作结果，查看执行详情与异常。" },
+  tasks: { title: "任务中心", group: "系统工具", description: "跟踪后台进度、取消待执行工作，查看逐文件结果。" },
   logs: { title: "运行日志", group: "系统工具", description: "查看服务运行输出，定位任务与系统问题。" },
   users: { title: "用户管理", group: "系统工具", description: "管理登录用户及其访问权限。" },
   settings: { title: "系统与账号", group: "系统工具", description: "查看系统信息，管理当前账号。" },
@@ -310,6 +354,16 @@ const fileDeletePreview = ref<DeleteFilesPreview | null>(null);
 const fileDeleteRequest = ref<{ root: number; paths: string[]; roots_version: string; preview_id: string } | null>(null);
 const fileDeleteError = ref("");
 const fileDeleteResult = ref<DeleteFilesResult | null>(null);
+const migrationSource = ref("");
+const migrationTarget = ref(-1);
+const migrationEntries = ref<FileEntry[]>([]);
+const migrationSelected = ref<string[]>([]);
+const migrationSelectable = computed(() => migrationEntries.value.filter(file => !file.directory && !file.blocked));
+const migrationDialog = ref<HTMLDialogElement | null>(null);
+const migrationPreview = ref<MigrationPreview | null>(null);
+const migrationRequest = ref<MigrationRequest | null>(null);
+const migrationError = ref("");
+const migrationResult = ref<MigrationResult | null>(null);
 const plan = ref<FilePlan | null>(null);
 const plannedRequest = ref<FileRequest | null>(null);
 const hostReport = ref<HostReport | null>(null);
@@ -437,6 +491,106 @@ async function api<T>(path: string, body?: unknown, method?: string): Promise<T>
   return response.json() as Promise<T>;
 }
 
+function taskActive(task: BackgroundTask) { return task.status === "queued" || task.status === "running"; }
+async function loadTaskDetail(id: string) {
+  taskDetailId.value = id;
+  const generation = taskGeneration;
+  try {
+    const data = await api<BackgroundTask>(`/tasks/${encodeURIComponent(id)}`);
+    if (connected.value && generation === taskGeneration && taskDetailId.value === id) taskDetail.value = data;
+  } catch (cause) {
+    if (connected.value && generation === taskGeneration) taskError.value = String(cause);
+  }
+}
+async function loadTasks() {
+  if (taskLoading.value) return;
+  const generation = taskGeneration;
+  taskLoading.value = true;
+  try {
+    const data = await api<BackgroundTask[]>("/tasks");
+    if (!connected.value || generation !== taskGeneration) return;
+    taskRecords.value = data; taskError.value = "";
+    if (taskDetailId.value && (!taskDetail.value || taskActive(taskDetail.value))) await loadTaskDetail(taskDetailId.value);
+  } catch (cause) {
+    if (connected.value && generation === taskGeneration) taskError.value = String(cause);
+  } finally { taskLoading.value = false; }
+}
+async function pollTasks(generation: number) {
+  if (generation !== taskGeneration || !connected.value || tab.value !== "tasks") return;
+  await loadTasks();
+  if (generation === taskGeneration && connected.value && tab.value === "tasks") taskTimer = setTimeout(() => { void pollTasks(generation); }, 2000);
+}
+watch([tab, connected], () => {
+  taskGeneration++;
+  if (taskTimer !== undefined) clearTimeout(taskTimer);
+  if (!connected.value) {
+    taskRecords.value = []; taskDetail.value = null; taskDetailId.value = ""; taskError.value = "";
+    embyForm.value.api_token = "";
+  }
+  if (connected.value && tab.value === "tasks") void pollTasks(taskGeneration);
+});
+async function cancelTask(task: BackgroundTask) {
+  if (!window.confirm("取消任务？当前文件或重命名文件组完成后停止，已完成的修改不会回滚。")) return;
+  taskCancelling.value = task.id;
+  const generation = taskGeneration;
+  try {
+    await api(`/tasks/${encodeURIComponent(task.id)}/cancel`, {});
+    if (connected.value && generation === taskGeneration) await loadTasks();
+  } catch (cause) {
+    if (connected.value && generation === taskGeneration) taskError.value = String(cause);
+  } finally { taskCancelling.value = ""; }
+}
+async function queueTask(kind: string, request: unknown) {
+  const task = await api<BackgroundTask>("/tasks", { kind, request });
+  taskDetail.value = task; taskDetailId.value = task.id;
+  tab.value = "tasks";
+  notice.value = "任务已提交，可离开页面；执行结果请在任务中心查看。";
+}
+async function loadEmby() {
+  embySaved.value = await api<EmbyConfiguration>("/emby");
+  embyForm.value = { ...embySaved.value, api_token: "" };
+  embyLibraries.value = []; embyLibrary.value = "";
+}
+async function saveEmby() {
+  await run(async () => {
+    try {
+      embySaved.value = await api<EmbyConfiguration>("/emby", embyForm.value, "PUT");
+      embyForm.value.server_url = embySaved.value.server_url;
+      embyLibraries.value = []; embyLibrary.value = "";
+      notice.value = "Emby 配置已保存。";
+    } finally { embyForm.value.api_token = ""; }
+  });
+}
+async function clearEmbyToken() {
+  if (!window.confirm("立即清除已保存的 Emby Token 并关闭自动刷新？")) return;
+  await run(async () => {
+    embySaved.value = await api<EmbyConfiguration>("/emby/token", undefined, "DELETE");
+    embyForm.value.api_token = ""; embyForm.value.auto_refresh = false;
+    embyLibraries.value = []; embyLibrary.value = "";
+    notice.value = "Token 已清除，自动刷新已关闭。";
+  });
+}
+async function testEmby() {
+  await run(async () => {
+    const data = await api<{ server_name: string; version: string }>("/emby/test", {});
+    notice.value = `连接正常：${data.server_name} ${data.version}`;
+  });
+}
+async function readEmbyLibraries() {
+  await run(async () => {
+    embyLibraries.value = await api<{ id: string; name: string }[]>("/emby/libraries");
+    embyLibrary.value = "";
+    notice.value = `已读取 ${embyLibraries.value.length} 个媒体库。`;
+  });
+}
+async function refreshEmby(all: boolean) {
+  if (!window.confirm(all ? "请求 Emby 刷新全部媒体库？" : "请求 Emby 刷新所选媒体库？")) return;
+  await run(async () => {
+    const data = await api<{ message: string }>("/emby/refresh", { library_id: all ? null : embyLibrary.value });
+    notice.value = data.message;
+  });
+}
+
 async function run(work: () => Promise<void>) {
   if (busy.value) return;
   busy.value = true;
@@ -471,6 +625,7 @@ async function loadWorkspace(reloadEditors = true) {
   config.value = await api<Config>("/config");
   selectedRootPaths.value = [];
   fileDeleteResult.value = null; fileDeletePreview.value = null; fileDeleteRequest.value = null;
+  resetMigration();
   if (reloadEditors) hostSource.value = config.value.hosts_source;
   root.value = config.value.roots[0]?.id ?? 0;
   metadataRoot.value = -1;
@@ -489,7 +644,7 @@ async function loadWorkspace(reloadEditors = true) {
   connected.value = true;
   await loadRecords();
   await Promise.all([loadMetadataMappings(), loadFiles(), loadVideoStatus(),
-    ...(reloadEditors ? [loadScrapers(), loadRenameRules()] : [])]);
+    ...(reloadEditors ? [loadScrapers(), loadRenameRules(), ...(isAdmin.value ? [loadEmby()] : [])] : [])]);
 }
 
 function bitrate(value: number | null | undefined) {
@@ -538,19 +693,15 @@ async function pollVideoStatus() {
 async function inspectVideos(force = false) {
   await run(async () => {
     if (videoInfoRoot.value < 0) throw new Error("请先选择媒体目录。");
-    const data = await api<{ analyzed: number; cached: number; deferred: number; failed: number }>(
-      "/video-info/scan", { root: videoInfoRoot.value, roots_version: config.value?.roots_version, force },
-    );
-    await refreshVideoRows();
-    noticeTone.value = data.failed || data.deferred ? "warning" : "success";
-    notice.value = `新识别 ${data.analyzed}，复用记录 ${data.cached}，暂缓 ${data.deferred}，失败 ${data.failed}。未修改视频。`;
+    await queueTask("video.info.scan", { root: videoInfoRoot.value, roots_version: config.value?.roots_version, force });
   });
 }
 
 async function inspectAllVideos() {
   await run(async () => {
-    videoInfoStatus.value = await api<VideoInfoStatus>("/video-info/scan-all", {});
-    notice.value = "已请求后台补扫所有媒体目录；未变化且已有有效记录的视频会跳过。";
+    await api("/tasks/video-scan-all", {});
+    tab.value = "tasks";
+    notice.value = "已按媒体目录提交扫描任务；未变化的视频会复用已有记录。";
   });
 }
 
@@ -599,7 +750,8 @@ async function browseMediaFolders(path?: string | null) {
     }
   });
 }
-async function openMediaFolderDialog() {
+async function openMediaFolderDialog(purpose: "root" | "migration" = "root") {
+  folderPickerPurpose.value = purpose;
   mediaFolderListing.value = null; mediaFolderError.value = "";
   await nextTick();
   mediaFolderDialog.value?.showModal();
@@ -607,11 +759,13 @@ async function openMediaFolderDialog() {
 }
 async function addMediaFolder() {
   const listing = mediaFolderListing.value;
-  if (!listing?.path || !listing.selectable || mediaFolderError.value || mediaFolderAlreadyAdded.value || mediaRootsDraft.value.length >= 32) return;
+  if (!listing?.path || !listing.selectable || mediaFolderError.value) return;
+  if (folderPickerPurpose.value === "root" && (mediaFolderAlreadyAdded.value || mediaRootsDraft.value.length >= 32)) return;
   const path = listing.path;
   await run(async () => {
     try {
-      await saveMediaRoots([...mediaRootsDraft.value, path]);
+      if (folderPickerPurpose.value === "migration") await loadMigrationFiles(path);
+      else await saveMediaRoots([...mediaRootsDraft.value, path]);
       mediaFolderDialog.value?.close();
     } catch (cause) {
       mediaFolderError.value = cause instanceof Error ? cause.message : String(cause);
@@ -638,6 +792,7 @@ async function logout() {
     config.value = null;
     selectedRootPaths.value = []; mediaFolderListing.value = null; mediaFolderError.value = "";
     selectedFilePaths.value = []; fileDeletePreview.value = null; fileDeleteRequest.value = null; fileDeleteResult.value = null;
+    resetMigration();
     selectedRuleIds.value = []; selectedMappingIds.value = [];
     entries.value = []; records.value = []; users.value = [];
     recordsVersion.value++; operationDetails.value = {};
@@ -725,6 +880,57 @@ async function deleteFiles() {
     await loadFiles();
     noticeTone.value = fileDeleteResult.value.outcome === "success" ? "success" : "warning";
     notice.value = `删除完成：成功 ${fileDeleteResult.value.deleted_count} 个，失败 ${fileDeleteResult.value.files.length - fileDeleteResult.value.deleted_count} 个。`;
+  });
+}
+
+function resetMigration() {
+  migrationSource.value = ""; migrationTarget.value = -1;
+  migrationEntries.value = []; migrationSelected.value = [];
+  migrationPreview.value = null; migrationRequest.value = null;
+  migrationResult.value = null; migrationError.value = "";
+}
+async function loadMigrationFiles(folder = migrationSource.value) {
+  const data = await api<{ source_folder: string; entries: FileEntry[] }>(
+    `/files/migration/source?path=${encodeURIComponent(folder)}`,
+  );
+  migrationSource.value = data.source_folder;
+  migrationEntries.value = data.entries;
+  migrationSelected.value = [];
+}
+watch([migrationSource, migrationTarget], () => {
+  migrationPreview.value = null; migrationRequest.value = null;
+  migrationResult.value = null; migrationError.value = "";
+});
+async function confirmMigration() {
+  await run(async () => {
+    if (!config.value || !migrationSource.value || migrationTarget.value < 0 || !migrationSelected.value.length) {
+      throw new Error("请选择下载目录、需要迁移的文件和目标媒体目录。");
+    }
+    const request: MigrationRequest = {
+      source_folder: migrationSource.value, paths: [...migrationSelected.value],
+      target_root: migrationTarget.value, roots_version: config.value.roots_version,
+    };
+    migrationError.value = ""; migrationPreview.value = null; migrationRequest.value = null;
+    const preview = await api<MigrationPreview>("/files/migration", { ...request, dry_run: true });
+    migrationPreview.value = preview;
+    migrationRequest.value = { ...request, preview_id: preview.preview_id };
+    await nextTick();
+    migrationDialog.value?.showModal();
+  });
+}
+async function migrateFiles() {
+  const request = migrationRequest.value;
+  if (!request) return;
+  await run(async () => {
+    migrationRequest.value = null; migrationResult.value = null;
+    try {
+      await queueTask("file.migrate", { ...request, dry_run: false });
+    } catch (cause) {
+      migrationError.value = `${cause instanceof Error ? cause.message : String(cause)}。请核对源目录、目标目录和操作记录，不要直接重复迁移。`;
+      throw cause;
+    }
+    migrationDialog.value?.close();
+    migrationSelected.value = [];
   });
 }
 
@@ -851,10 +1057,8 @@ async function applyRenaming() {
   if (!window.confirm(`确认按已校验的预览重命名 ${report.ready_count} 个视频及相关 NFO / 字幕，共 ${report.file_count} 个文件？仅当前文件夹，不处理子文件夹；冲突项跳过，不覆盖文件。`)) return;
   await run(async () => {
     renameReport.value = null;
-    renameResult.value = await api<RenameResult>("/renaming/apply", { preview_id: report.preview_id });
+    await queueTask("rename.apply", { preview_id: report.preview_id });
     metadataPlan.value = null;
-    noticeTone.value = renameResult.value.outcome === "success" ? "success" : "warning";
-    notice.value = `重命名${outcomeNames[renameResult.value.outcome]}，完成 ${renameResult.value.renamed_count} 个视频。`;
   });
 }
 
@@ -1087,9 +1291,7 @@ async function applyMetadata() {
   await run(async () => {
     await ensureScrapersReady();
     metadataPlan.value = null;
-    metadataResult.value = await api<MetadataResult>("/metadata/apply", { preview_id: previewId });
-    noticeTone.value = metadataResult.value.outcome === "success" ? "success" : "warning";
-    notice.value = `写入${outcomeNames[metadataResult.value.outcome]}，请查看逐文件结果，再在 Emby 中刷新元数据。`;
+    await queueTask("metadata.apply", { preview_id: previewId });
   });
 }
 
@@ -1176,6 +1378,8 @@ watch([tab, connected, followLog, logLines], () => {
   if (connected.value && tab.value === "logs") void readLogs();
 });
 onUnmounted(() => {
+  taskGeneration++;
+  if (taskTimer !== undefined) clearTimeout(taskTimer);
   videoPollingEnabled = false;
   if (videoInfoTimer !== undefined) clearTimeout(videoInfoTimer);
   stopLogTracking();
@@ -1281,6 +1485,7 @@ async function changePassword() {
         <span class="nav-group">媒体工具</span>
         <div class="nav-children">
         <button :class="{ active: tab === 'files' }" :aria-current="tab === 'files' ? 'page' : undefined" @click="tab = 'files'">文件浏览</button>
+        <button v-if="isAdmin" :class="{ active: tab === 'migration' }" :aria-current="tab === 'migration' ? 'page' : undefined" @click="tab = 'migration'">文件迁移</button>
         <button :class="{ active: tab === 'renaming' }" :aria-current="tab === 'renaming' ? 'page' : undefined" @click="tab = 'renaming'">批量重命名</button>
         <button :class="{ active: tab === 'metadata' }" :aria-current="tab === 'metadata' ? 'page' : undefined" @click="tab = 'metadata'">影视刮削</button>
         <button :class="{ active: tab === 'video-info' }" :aria-current="tab === 'video-info' ? 'page' : undefined" @click="tab = 'video-info'">视频分析 <small>自动</small></button>
@@ -1293,10 +1498,11 @@ async function changePassword() {
         <button :class="{ active: tab === 'configuration' }" :aria-current="tab === 'configuration' ? 'page' : undefined" @click="openConfiguration()">配置管理</button>
         </div>
         </div>
-        <details class="nav-section nav-tools" :open="['hosts', 'users', 'settings', 'operations', 'logs'].includes(tab)">
+        <details class="nav-section nav-tools" :open="['hosts', 'users', 'settings', 'tasks', 'operations', 'logs'].includes(tab)">
           <summary>系统工具</summary>
           <div class="nav-children">
             <button :class="{ active: tab === 'hosts' }" :aria-current="tab === 'hosts' ? 'page' : undefined" @click="tab = 'hosts'">Hosts 更新</button>
+            <button :class="{ active: tab === 'tasks' }" :aria-current="tab === 'tasks' ? 'page' : undefined" @click="tab = 'tasks'">任务中心</button>
             <button :class="{ active: tab === 'operations' }" :aria-current="tab === 'operations' ? 'page' : undefined" :disabled="busy" @click="showRecords">操作记录</button>
             <button :class="{ active: tab === 'logs' }" :aria-current="tab === 'logs' ? 'page' : undefined" @click="tab = 'logs'">运行日志</button>
             <button v-if="isAdmin" :class="{ active: tab === 'users' }" :aria-current="tab === 'users' ? 'page' : undefined" :disabled="busy" @click="showUsers">用户管理</button>
@@ -1340,6 +1546,27 @@ async function changePassword() {
           <button class="module-card" data-tool="video-info" @click="tab = 'video-info'"><svg class="module-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="3" y="4" width="18" height="14" rx="2" /><path d="M8 22h8m-4-4v4M7 13v-3m5 3V7m5 6v-4" /></svg><b>视频分析</b><span>查看编码、码率与播放风险</span><span class="module-arrow" aria-hidden="true">↗</span></button>
         </div></section>
       </section>
+      <section v-if="tab === 'tasks'" class="panel">
+        <div class="config-section-heading"><h2>后台任务（最近 100 条）</h2><button :disabled="taskLoading" @click="loadTasks">刷新任务</button></div>
+        <p class="help-text">每 2 秒更新。取消在当前文件或整组重命名完成后生效，不回滚已完成的修改。服务重启后未完成任务标记为中断，不自动重试。</p>
+        <p v-if="taskError" class="message error" role="alert">{{ taskError }}</p>
+        <div class="table-wrap"><table><thead><tr><th>任务 / 时间</th><th>状态</th><th>进度</th><th>操作</th></tr></thead><tbody>
+          <tr v-for="task in taskRecords" :key="task.id">
+            <td><strong>{{ taskNames[task.kind] || task.kind }}</strong><p class="path-caption">{{ task.actor }} · {{ new Date(task.created_at).toLocaleString() }}</p></td>
+            <td><span class="status-chip" :class="{ 'status-error': task.status === 'failed', 'status-warning': task.status !== 'success' && task.status !== 'failed' }">{{ taskStatuses[task.status] || task.status }}</span><p v-if="task.cancel_requested && taskActive(task)" class="help-text">等待安全停止</p></td>
+            <td><progress v-if="taskActive(task)" :max="task.total || 1" :value="task.total ? task.completed : undefined" aria-label="任务进度"></progress><span v-if="task.total"> {{ task.completed }} / {{ task.total }}</span><p class="path-caption">{{ task.current || task.error || "—" }}</p></td>
+            <td><div class="row-actions"><button @click="taskDetail = null; loadTaskDetail(task.id)">查看结果</button><button v-if="isAdmin && taskActive(task)" :disabled="task.cancel_requested || taskCancelling === task.id" @click="cancelTask(task)">取消任务</button></div></td>
+          </tr>
+          <tr v-if="!taskRecords.length"><td colspan="4">{{ taskLoading ? "正在加载…" : "暂无后台任务" }}</td></tr>
+        </tbody></table></div>
+        <div v-if="taskDetail" class="task-detail">
+          <h3>{{ taskNames[taskDetail.kind] || taskDetail.kind }} · {{ taskStatuses[taskDetail.status] || taskDetail.status }}</h3>
+          <p class="path-caption">任务编号：{{ taskDetail.id }}</p>
+          <p v-if="taskDetail.error" class="message error">{{ taskDetail.error }}</p>
+          <p v-if="taskActive(taskDetail)" class="help-text">任务尚未结束，结果将在完成后显示。</p>
+          <pre v-else>{{ JSON.stringify(taskDetail.result, null, 2) }}</pre>
+        </div>
+      </section>
       <section v-if="tab === 'configuration'" class="configuration-nav">
         <p v-if="!isAdmin">只有管理员可以修改配置。</p>
         <nav v-else class="section-tabs" aria-label="配置分类">
@@ -1351,7 +1578,7 @@ async function changePassword() {
         <div>
           <div class="config-section-heading">
             <p class="help-text">新增、移除立即生效，无需再次保存；移除不会删除磁盘文件。</p>
-            <button type="button" :disabled="busy || mediaRootsDraft.length >= 32" @click="openMediaFolderDialog">添加文件夹</button>
+            <button type="button" :disabled="busy || mediaRootsDraft.length >= 32" @click="openMediaFolderDialog('root')">添加文件夹</button>
           </div>
           <div class="row-actions selection-actions">
             <label class="check-control"><input type="checkbox" :checked="!!mediaRootsDraft.length && selectedRootPaths.length === mediaRootsDraft.length" :disabled="busy || !mediaRootsDraft.length" @change="selectedRootPaths = selectedRootPaths.length === mediaRootsDraft.length ? [] : [...mediaRootsDraft]" /><span>全选目录</span></label>
@@ -1365,30 +1592,6 @@ async function changePassword() {
             <tr v-if="!mediaRootsDraft.length"><td colspan="3">尚未选择目录，请点击“添加文件夹”。</td></tr>
           </tbody></table></div>
         </div>
-        <dialog ref="mediaFolderDialog" class="folder-picker" aria-labelledby="folder-picker-title" @cancel="busy && $event.preventDefault()">
-          <h2 id="folder-picker-title">选择媒体文件夹</h2>
-          <div class="row-actions">
-            <button :disabled="busy" @click="browseMediaFolders()">磁盘列表</button>
-            <button :disabled="busy || !mediaFolderListing?.path" @click="browseMediaFolders(mediaFolderListing?.parent)">上一级</button>
-          </div>
-          <div class="folder-picker-body">
-          <p>当前位置：<code>{{ mediaFolderListing?.path || "请选择磁盘" }}</code></p>
-          <p v-if="busy">正在读取文件夹…</p>
-          <p v-if="mediaFolderError" class="message error" role="alert">{{ mediaFolderError }}</p>
-          <div v-if="mediaFolderListing" class="folder-list">
-            <button v-for="folder in mediaFolderListing.entries" :key="folder.path" :disabled="busy || folder.blocked" @click="browseMediaFolders(folder.path)">
-              {{ folder.name }}{{ folder.blocked ? "（链接，不可选择）" : "" }}
-            </button>
-            <p v-if="!mediaFolderListing.entries.length">无子文件夹</p>
-          </div>
-          <p v-if="mediaFolderListing?.reason" class="warning">{{ mediaFolderListing.reason }}；可继续进入子文件夹。</p>
-          <p v-if="mediaFolderAlreadyAdded" class="message">此文件夹已添加。</p>
-          </div>
-          <div class="config-actions">
-            <button :disabled="busy" @click="mediaFolderDialog?.close()">取消</button>
-            <button class="primary" :disabled="busy || !mediaFolderListing?.selectable || !!mediaFolderError || mediaFolderAlreadyAdded || mediaRootsDraft.length >= 32" @click="addMediaFolder">添加当前文件夹</button>
-          </div>
-        </dialog>
       </section>
       <section v-if="tab === 'files'" class="panel">
         <h2>媒体文件</h2>
@@ -1458,6 +1661,64 @@ async function changePassword() {
             <button class="destructive" :disabled="busy || !fileDeleteRequest" @click="deleteFiles">确认永久删除</button>
           </div>
         </dialog>
+      </section>
+      <section v-if="tab === 'migration'" class="panel">
+        <h2>从下载目录迁移文件</h2>
+        <p v-if="!isAdmin">只有管理员可以浏览下载目录和迁移文件。</p>
+        <template v-else>
+          <p class="help-text">选择的是运行服务这台电脑上的目录，无需加入媒体目录配置。请先确保下载已完成；仅移动勾选的直属文件，不递归移动文件夹。</p>
+          <div class="toolbar">
+            <button :disabled="busy" @click="openMediaFolderDialog('migration')">选择下载目录</button>
+            <button :disabled="busy || !migrationSource" @click="run(() => loadMigrationFiles())">刷新下载文件</button>
+          </div>
+          <p class="path-caption">下载目录：<code>{{ migrationSource || "尚未选择" }}</code></p>
+          <p v-if="!config.roots.length" class="message">请先在<a href="#configuration/roots">配置管理</a>中添加目标媒体目录。</p>
+          <div class="toolbar">
+            <label class="directory-field">目标媒体目录<select v-model.number="migrationTarget" :disabled="busy || !config.roots.length" aria-label="迁移目标媒体目录">
+              <option :value="-1" disabled>请选择目标媒体目录</option>
+              <option v-for="item in config.roots" :key="item.id" :value="item.id" :title="item.path">{{ rootLabel(item.path) }}</option>
+            </select></label>
+            <button class="primary" :disabled="busy || !migrationSelected.length || migrationTarget < 0" @click="confirmMigration">迁移所选文件（{{ migrationSelected.length }}）</button>
+          </div>
+          <p v-if="migrationTarget >= 0" class="path-caption">目标目录：<code>{{ rootPath(migrationTarget) }}</code></p>
+          <div class="row-actions selection-actions">
+            <label class="check-control"><input type="checkbox" :checked="!!migrationSelectable.length && migrationSelectable.slice(0, 1000).every(file => migrationSelected.includes(file.path))" :disabled="busy || !migrationSelectable.length" @change="migrationSelected = migrationSelectable.slice(0, 1000).every(file => migrationSelected.includes(file.path)) ? [] : migrationSelectable.slice(0, 1000).map(file => file.path)" /><span>{{ migrationSelectable.length > 1000 ? "选择前 1000 个文件" : "全选下载文件" }}</span></label>
+            <span class="help-text">同名文件跳过、不覆盖；成功迁移后源文件将移走，每次最多 1000 个。</span>
+          </div>
+          <div class="table-wrap"><table><thead><tr><th class="selection-cell">选择</th><th>下载文件</th><th>类型</th><th>大小</th></tr></thead><tbody>
+            <tr v-for="file in migrationEntries" :key="file.path">
+              <td class="selection-cell"><input v-if="!file.directory && !file.blocked" v-model="migrationSelected" type="checkbox" :value="file.path" :disabled="busy || (migrationSelected.length >= 1000 && !migrationSelected.includes(file.path))" :aria-label="`选择下载文件 ${file.name}`" /></td>
+              <td>{{ file.name }}</td><td>{{ file.blocked ? "链接（禁止操作）" : file.directory ? "目录（不迁移）" : "文件" }}</td>
+              <td>{{ file.directory ? "—" : (file.size / 1024 / 1024).toFixed(2) + " MB" }}</td>
+            </tr>
+            <tr v-if="!migrationEntries.length"><td colspan="4">{{ migrationSource ? "下载目录为空" : "请先选择下载目录" }}</td></tr>
+          </tbody></table></div>
+          <div v-if="migrationResult" class="preview">
+            <h3>迁移结果：成功 {{ migrationResult.moved_count }} 个，跳过 {{ migrationResult.skipped_count }} 个，失败 {{ migrationResult.failed_count }} 个</h3>
+            <div class="table-wrap"><table><thead><tr><th>文件 / 目标路径</th><th>结果</th><th>说明</th></tr></thead><tbody>
+              <tr v-for="file in migrationResult.files" :key="file.path">
+                <td>{{ file.path }}<p class="path-caption"><code>{{ file.destination }}</code></p></td>
+                <td>{{ file.status === "success" ? "已迁移" : file.status === "skipped" ? "已跳过" : "失败" }}</td><td>{{ file.error || "源文件已移走" }}</td>
+              </tr>
+            </tbody></table></div>
+          </div>
+          <dialog ref="migrationDialog" class="folder-picker" aria-labelledby="migration-title" @cancel="busy && $event.preventDefault()">
+            <h2 id="migration-title">确认文件迁移</h2>
+            <div class="folder-picker-body">
+              <p>待迁移 {{ migrationPreview?.ready_count ?? 0 }} 个，同名跳过 {{ migrationPreview?.skipped_count ?? 0 }} 个。保留文件名及扩展名，不覆盖目标文件。</p>
+              <p>源目录：<code>{{ migrationRequest?.source_folder || migrationSource }}</code></p>
+              <p>目标目录：<code>{{ rootPath(migrationTarget) }}</code></p>
+              <ul class="delete-file-list"><li v-for="file in migrationPreview?.files" :key="file.path"><code>{{ file.path }}</code>：{{ file.status === "skipped" ? file.error : "待迁移" }}</li></ul>
+              <p v-if="busy" role="status">正在提交后台任务，请勿重复提交。跨磁盘大文件可能耗时较长，可在任务中心查看进度。</p>
+              <p v-if="!migrationPreview?.ready_count" class="warning">没有可迁移的文件，请调整选择或目标目录。</p>
+              <p v-if="migrationError" class="message error" role="alert">{{ migrationError }}</p>
+            </div>
+            <div class="config-actions">
+              <button :disabled="busy" @click="migrationDialog?.close(); migrationRequest = null">{{ migrationError ? "关闭并核对" : "取消" }}</button>
+              <button class="primary" :disabled="busy || !migrationRequest || !migrationPreview?.ready_count" @click="migrateFiles">确认迁移</button>
+            </div>
+          </dialog>
+        </template>
       </section>
       <section v-if="tab === 'renaming' || (tab === 'configuration' && isAdmin && configurationSection === 'renaming')" class="panel">
         <h2>{{ tab === "configuration" ? "命名规则" : "按集号整理文件名" }}</h2>
@@ -1931,6 +2192,31 @@ async function changePassword() {
           <p><small>本产品使用 TMDB API，但未经 TMDB 认可或认证。元数据与图片来源：<a href="https://www.themoviedb.org/" target="_blank" rel="noopener noreferrer">The Movie Database (TMDB)</a>。</small></p>
         </template>
       </section>
+      <section v-if="tab === 'configuration' && isAdmin && configurationSection === 'emby'" class="panel">
+        <h2>Emby 联动</h2>
+        <p class="help-text">使用 Emby 后台创建的 API Token。Token 仅保存到服务器数据库，不回传浏览器；远程连接建议使用 HTTPS。接口前缀按实际部署填写，例如 /emby。</p>
+        <form @submit.prevent="saveEmby">
+          <div class="config-fields">
+            <label class="config-field">服务地址<input v-model="embyForm.server_url" type="url" required maxlength="2000" placeholder="http://127.0.0.1:8096/emby" :disabled="busy" /></label>
+            <label class="config-field">API Token<input v-model="embyForm.api_token" type="password" autocomplete="new-password" maxlength="2048" :placeholder="embySaved.configured ? '已保存，留空保留原 Token' : '填写 Emby API Token'" :disabled="busy" /></label>
+          </div>
+          <label class="check-control"><input v-model="embyForm.auto_refresh" type="checkbox" :disabled="busy" /><span>迁移、刮削或批量重命名实际修改文件后，自动请求刷新全部媒体库</span></label>
+          <div class="config-actions">
+            <button class="primary" :disabled="busy || !embyDirty">保存 Emby 配置</button>
+            <button type="button" :disabled="busy || !embySaved.configured || embyDirty" @click="testEmby">测试连接</button>
+            <button type="button" class="danger-button" :disabled="busy || !embySaved.configured" @click="clearEmbyToken">清除 Token</button>
+          </div>
+        </form>
+        <p v-if="embyDirty" class="help-text">有未保存的配置；请先保存，再测试连接或刷新媒体库。更换地址需重新填写 Token。</p>
+        <h3>媒体库刷新</h3>
+        <div class="toolbar">
+          <label class="directory-field">Emby 媒体库<select v-model="embyLibrary" :disabled="busy || !embyLibraries.length || embyDirty"><option value="">请先读取并选择媒体库</option><option v-for="library in embyLibraries" :key="library.id" :value="library.id">{{ library.name }}</option></select></label>
+          <button :disabled="busy || !embySaved.configured || embyDirty" @click="readEmbyLibraries">读取媒体库</button>
+          <button :disabled="busy || !embyLibrary || embyDirty" @click="refreshEmby(false)">刷新所选库</button>
+          <button :disabled="busy || !embySaved.configured || embyDirty" @click="refreshEmby(true)">刷新全部库</button>
+        </div>
+        <p class="help-text">这里只提交刷新请求，不强制替换已有元数据或图片。实际扫描进度请在 Emby 查看；自动刷新失败不回滚已完成的文件操作。</p>
+      </section>
       <section v-if="tab === 'configuration' && isAdmin && configurationSection === 'downloaders'" class="panel">
         <h2>网站与下载器 <span class="badge">功能预留</span></h2>
         <div class="empty-state">
@@ -1977,6 +2263,30 @@ async function changePassword() {
         </div>
       </section>
     </template>
+    <dialog v-if="connected && isAdmin" ref="mediaFolderDialog" class="folder-picker" aria-labelledby="folder-picker-title" @cancel="busy && $event.preventDefault()">
+      <h2 id="folder-picker-title">{{ folderPickerPurpose === "migration" ? "选择下载目录" : "选择媒体文件夹" }}</h2>
+      <div class="row-actions">
+        <button :disabled="busy" @click="browseMediaFolders()">磁盘列表</button>
+        <button :disabled="busy || !mediaFolderListing?.path" @click="browseMediaFolders(mediaFolderListing?.parent)">上一级</button>
+      </div>
+      <div class="folder-picker-body">
+        <p>当前位置：<code>{{ mediaFolderListing?.path || "请选择磁盘" }}</code></p>
+        <p v-if="busy">正在处理…</p>
+        <p v-if="mediaFolderError" class="message error" role="alert">{{ mediaFolderError }}</p>
+        <div v-if="mediaFolderListing" class="folder-list">
+          <button v-for="folder in mediaFolderListing.entries" :key="folder.path" :disabled="busy || folder.blocked" @click="browseMediaFolders(folder.path)">
+            {{ folder.name }}{{ folder.blocked ? "（链接，不可选择）" : "" }}
+          </button>
+          <p v-if="!mediaFolderListing.entries.length">无子文件夹</p>
+        </div>
+        <p v-if="mediaFolderListing?.reason" class="warning">{{ mediaFolderListing.reason }}；可继续进入子文件夹。</p>
+        <p v-if="folderPickerPurpose === 'root' && mediaFolderAlreadyAdded" class="message">此文件夹已添加。</p>
+      </div>
+      <div class="config-actions">
+        <button :disabled="busy" @click="mediaFolderDialog?.close()">取消</button>
+        <button class="primary" :disabled="busy || !mediaFolderListing?.selectable || !!mediaFolderError || (folderPickerPurpose === 'root' && (mediaFolderAlreadyAdded || mediaRootsDraft.length >= 32))" @click="addMediaFolder">{{ folderPickerPurpose === "migration" ? "使用此下载目录" : "添加当前文件夹" }}</button>
+      </div>
+    </dialog>
     <footer>{{ busy ? "正在处理…" : "MediaForge" }}</footer>
     </main>
   </div>

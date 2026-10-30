@@ -1,7 +1,13 @@
 import pytest
 from sqlalchemy import event, inspect, text
 
-from mediaforge.database import OPERATION_TIME_INDEX, Operation, initialize_database
+from mediaforge.database import (
+    OPERATION_TIME_INDEX,
+    BackgroundTask,
+    EmbySetting,
+    Operation,
+    initialize_database,
+)
 
 
 def test_audit_commits_intent_and_releases_connection_before_action(store, sessions):
@@ -62,6 +68,13 @@ def test_startup_adds_time_index_to_existing_table_idempotently(sessions):
     if engine.dialect.name != "sqlite":
         pytest.skip("Do not initialize the application's schema from an isolated PG fixture")
     OPERATION_TIME_INDEX.drop(engine)
+    BackgroundTask.__table__.drop(engine)
+    EmbySetting.__table__.drop(engine)
+    with sessions() as session:
+        record = Operation(kind="existing", request={"keep": True}, actor="admin")
+        session.add(record)
+        session.commit()
+        existing_id = record.id
     assert OPERATION_TIME_INDEX.name not in {
         index["name"] for index in inspect(engine).get_indexes("operations")
     }
@@ -80,3 +93,6 @@ def test_startup_adds_time_index_to_existing_table_idempotently(sessions):
     assert OPERATION_TIME_INDEX.name in {
         index["name"] for index in inspect(engine).get_indexes("operations")
     }
+    assert {"background_tasks", "emby_settings"} <= set(inspect(engine).get_table_names())
+    with sessions() as session:
+        assert session.get(Operation, existing_id).request == {"keep": True}
