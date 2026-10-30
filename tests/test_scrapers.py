@@ -63,6 +63,23 @@ def test_environment_fallback_is_imported_only_before_database_override(service)
     assert service.scrapers.credential("tmdb") is None
 
 
+def test_immediate_clear_key_preserves_saved_settings_and_is_repeatable(service, caplog):
+    save(service, api_key=KEY, enabled=False, priority=4)
+    service.settings.tmdb_api_key = SecretStr(REPLACEMENT)
+    for _ in range(2):
+        result = service.clear_scraper_key("tmdb")
+        saved = result["scrapers"][0]
+        assert saved["enabled"] is False and saved["priority"] == 4
+        assert saved["configured"] is False
+        assert service.scrapers.credential("tmdb") is None
+    restarted = MetadataService(service.settings, service.files, service.store)
+    assert restarted.scrapers.credential("tmdb") is None
+    exposed = str(result) + str(service.store.recent()) + caplog.text
+    assert KEY not in exposed and REPLACEMENT not in exposed
+    with pytest.raises(ValueError):
+        service.clear_scraper_key("missing")
+
+
 @pytest.mark.parametrize(
     "updates",
     [

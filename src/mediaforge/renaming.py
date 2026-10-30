@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path, PureWindowsPath
 from string import Formatter
-from typing import Any
+from typing import Annotated, Any
 from uuid import uuid4
 
 import regex
@@ -39,6 +39,12 @@ class RulesUpdate(BaseModel):
     rules: list[RuleInput] = Field(min_length=1, max_length=32)
 
 
+class RulesDelete(BaseModel):
+    ids: list[Annotated[str, Field(min_length=1, max_length=36)]] = Field(
+        min_length=1, max_length=32
+    )
+
+
 class RenamePreviewRequest(BaseModel):
     root: int = Field(ge=0)
     path: str = Field(default="", max_length=2000)
@@ -62,25 +68,13 @@ class RenameReviewRequest(RenameApplyRequest):
 def defaults() -> list[RuleInput]:
     return [
         RuleInput(
-            id="season-episode",
-            name="S01E01 中的集号",
+            id="general-episode",
+            name="通用规则",
             priority=0,
-            pattern=r"(?i)(?<![a-z0-9])S\d+[ ._-]*E(?P<episode>\d{1,3})(?!\d)",
-        ),
-        RuleInput(
-            id="episode-prefix",
-            name="第01集 / EP01",
-            priority=1,
             pattern=(
-                r"(?i)(?:第\s*(?P<episode>\d{1,3})\s*[集话話]|"
-                r"(?<![a-z0-9])EP?[ ._-]*(?P<episode>\d{1,3})(?![a-z0-9]))"
+                r"(?i)^(?P<title>.+?)[\s._\-\[\]()]*?"
+                r"(?:S\d{1,2}E|第\s*|(?:EP|(?<![a-z])E)[ ._-]*)(?P<episode>\d{1,4})"
             ),
-        ),
-        RuleInput(
-            id="number-token",
-            name="独立数字 01 / 1",
-            priority=2,
-            pattern=r"(?:^|[\s._\-\[\]【】()（）])(?P<episode>\d{1,3})(?=$|[\s._\-\[\]【】()（）])",
         ),
     ]
 
@@ -150,8 +144,7 @@ class RenameService:
             rules = []
             for rule in saved:
                 values = {key: getattr(rule, key) for key in RuleInput.model_fields}
-                if values["template"] == "S{season:02d}E{episode:02d}":
-                    values["template"] = "{episode:02d}"
+                values["template"] = "{episode:02d}"
                 rules.append(RuleInput(**values))
         return rules or defaults()
 
@@ -166,13 +159,46 @@ class RenameService:
             with self.store.sessions() as session:
                 session.execute(delete(RenameRule).where(RenameRule.id.not_in(ids)))
                 for rule in request.rules:
-                    session.merge(RenameRule(**rule.model_dump()))
+                    values = rule.model_dump()
+                    values["template"] = "{episode:02d}"
+                    session.merge(RenameRule(**values))
                 session.commit()
             self.previews.clear()
             return {"rules": [rule.model_dump() for rule in self.rules()]}
 
         with self.files.lock:
             return self.store.execute("rename.rules.save", request.model_dump(), apply)
+
+    def add_rule(self, rule: RuleInput) -> dict[str, Any]:
+        with self.files.lock:
+            rules = [
+                saved.model_copy(update={"priority": index})
+                for index, saved in enumerate(self.rules())
+            ]
+            if len(rules) >= 32:
+                raise ValueError("命名规则最多 32 条")
+            rule = rule.model_copy(update={"priority": len(rules)})
+            return self.save_rules(RulesUpdate(rules=[*rules, rule]))
+
+    def delete_rules(self, request: RulesDelete) -> dict[str, Any]:
+        with self.files.lock:
+            rules = self.rules()
+            ids = set(request.ids)
+            if len(ids) != len(request.ids):
+                raise ValueError("不能重复选择同一条规则")
+            if not ids.issubset({rule.id for rule in rules}):
+                raise ValueError("部分规则已不存在，请刷新列表")
+            remaining = [rule for rule in rules if rule.id not in ids]
+            if not remaining:
+                raise ValueError("至少保留一条命名规则")
+            return self.save_rules(
+                RulesUpdate(
+                    rules=[
+                        rule.model_copy(update={"priority": index})
+                        for index, rule in enumerate(remaining)
+                    ]
+                )
+            )
 
     def _listing(self, request: RenamePreviewRequest) -> tuple[list[dict[str, Any]], str]:
         listing = self.files.list(request.root, request.path, request.roots_version)["entries"]

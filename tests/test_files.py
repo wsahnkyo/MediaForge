@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from mediaforge.files import FileAction, FileService, MediaRootsUpdate
+from mediaforge.files import FileAction, FileDeleteBatch, FileService, MediaRootsUpdate
 
 
 @pytest.fixture
@@ -27,6 +27,161 @@ def confirmed(files, request):
             }
         )
     )
+
+
+def test_batch_delete_preview_execution_and_audit(files, store):
+    root = files.roots[0]
+    (root / "second.mkv").write_bytes(b"second")
+    request = FileDeleteBatch(
+        root=0, paths=["movie.mkv", "second.mkv"], roots_version=files.roots_version
+    )
+    preview = files.delete_batch(request)
+    assert len(preview["files"]) == 2 and preview["permanent"] is True
+    assert store.recent() == []
+    assert (root / "movie.mkv").exists() and (root / "second.mkv").exists()
+    result = files.delete_batch(
+        request.model_copy(
+            update={
+                "dry_run": False,
+                "preview_id": preview["preview_id"],
+            }
+        )
+    )
+    assert result["deleted_count"] == 2 and result["outcome"] == "success"
+    assert not (root / "movie.mkv").exists() and not (root / "second.mkv").exists()
+    assert (root / "archive").is_dir()
+    record = store.get(result["operation_id"])
+    assert record["kind"] == "file.delete.batch" and record["status"] == "success"
+    assert preview["preview_id"] not in files.previews
+
+
+@pytest.mark.parametrize(
+    "paths",
+    [
+        ["movie.mkv", "movie.mkv"],
+        ["movie.mkv", "archive"],
+        ["movie.mkv", "../outside.mkv"],
+        ["movie.mkv", "missing.mkv"],
+    ],
+)
+def test_batch_delete_rejects_invalid_selection_without_touching_files(files, paths):
+    request = FileDeleteBatch(root=0, paths=paths, roots_version=files.roots_version)
+    with pytest.raises((ValueError, OSError)):
+        files.delete_batch(request)
+    assert (files.roots[0] / "movie.mkv").read_bytes() == b"movie"
+    assert not files.previews
+
+
+@pytest.mark.parametrize("change", ["file", "selection", "actor", "expired", "missing-token"])
+def test_batch_delete_revalidates_entire_confirmation_before_any_deletion(files, change):
+    root = files.roots[0]
+    (root / "second.mkv").write_bytes(b"second")
+    request = FileDeleteBatch(
+        root=0, paths=["movie.mkv", "second.mkv"], roots_version=files.roots_version
+    )
+    preview = files.delete_batch(request)
+    request = request.model_copy(update={"dry_run": False, "preview_id": preview["preview_id"]})
+    if change == "file":
+        (root / "second.mkv").write_bytes(b"changed")
+    elif change == "selection":
+        request = request.model_copy(update={"paths": ["movie.mkv"]})
+    elif change == "actor":
+        files.previews[preview["preview_id"]].actor = "other-admin"
+    elif change == "expired":
+        files.previews[preview["preview_id"]].created -= 1801
+    else:
+        request = request.model_copy(update={"preview_id": None})
+    with pytest.raises(ValueError, match="预览"):
+        files.delete_batch(request)
+    assert (root / "movie.mkv").exists() and (root / "second.mkv").exists()
+
+
+@pytest.mark.parametrize("fail_all", [False, True])
+def test_batch_delete_reports_os_errors_and_consumes_token(files, store, monkeypatch, fail_all):
+    root = files.roots[0]
+    (root / "second.mkv").write_bytes(b"second")
+    request = FileDeleteBatch(
+        root=0, paths=["movie.mkv", "second.mkv"], roots_version=files.roots_version
+    )
+    preview = files.delete_batch(request)
+    unlink = Path.unlink
+
+    def denied(path, *args, **kwargs):
+        if fail_all or path.name == "movie.mkv":
+            raise PermissionError("test file locked")
+        return unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", denied)
+    result = files.delete_batch(
+        request.model_copy(
+            update={
+                "dry_run": False,
+                "preview_id": preview["preview_id"],
+            }
+        )
+    )
+    assert result["outcome"] == ("failed" if fail_all else "partial")
+    assert result["deleted_count"] == (0 if fail_all else 1)
+    assert result["files"][0]["error"] == "test file locked"
+    assert store.get(result["operation_id"])["status"] == result["outcome"]
+    assert preview["preview_id"] not in files.previews
+    assert (root / "movie.mkv").exists()
+
+
+def test_batch_delete_rechecks_each_file_after_operation_starts(files, monkeypatch):
+    root = files.roots[0]
+    second = root / "second.mkv"
+    second.write_bytes(b"second")
+    request = FileDeleteBatch(
+        root=0, paths=["movie.mkv", "second.mkv"], roots_version=files.roots_version
+    )
+    preview = files.delete_batch(request)
+    unlink = Path.unlink
+
+    def change_next(path, *args, **kwargs):
+        unlink(path, *args, **kwargs)
+        if path.name == "movie.mkv":
+            second.write_bytes(b"changed after confirmation")
+
+    monkeypatch.setattr(Path, "unlink", change_next)
+    result = files.delete_batch(
+        request.model_copy(
+            update={
+                "dry_run": False,
+                "preview_id": preview["preview_id"],
+            }
+        )
+    )
+    assert result["deleted_count"] == 1 and result["outcome"] == "partial"
+    assert "发生变化" in result["files"][1]["error"]
+    assert second.read_bytes() == b"changed after confirmation"
+
+
+def test_stale_root_update_and_batch_delete_do_not_change_new_configuration(
+    files, settings, tmp_path
+):
+    previous = files.roots_version
+    preview = files.delete_batch(
+        FileDeleteBatch(root=0, paths=["movie.mkv"], roots_version=previous)
+    )
+    new_root = tmp_path / "replacement-library"
+    new_root.mkdir()
+    (new_root / "movie.mkv").write_bytes(b"replacement")
+    files.save_roots(MediaRootsUpdate(roots=[str(new_root)], roots_version=previous), settings)
+    with pytest.raises(ValueError, match="配置已变化"):
+        files.save_roots(MediaRootsUpdate(roots=[], roots_version=previous), settings)
+    with pytest.raises(ValueError, match="配置已变化"):
+        files.delete_batch(
+            FileDeleteBatch(
+                root=0,
+                paths=["movie.mkv"],
+                roots_version=previous,
+                dry_run=False,
+                preview_id=preview["preview_id"],
+            )
+        )
+    assert files.roots == [new_root]
+    assert (new_root / "movie.mkv").read_bytes() == b"replacement"
 
 
 def test_media_folder_picker_lists_drives_and_only_direct_subdirectories(

@@ -30,13 +30,14 @@ from mediaforge.database import (
     make_engine,
     operation_actor,
 )
-from mediaforge.files import FileAction, FileService, MediaRootsUpdate
+from mediaforge.files import FileAction, FileDeleteBatch, FileService, MediaRootsUpdate
 from mediaforge.hosts import CHECKTMDB_URLS, HostsService
 from mediaforge.logs import LogService
 from mediaforge.metadata import (
     MetadataApply,
     MetadataCleanup,
     MetadataMappingInput,
+    MetadataMappingsDelete,
     MetadataPreview,
     MetadataSearch,
     MetadataService,
@@ -46,6 +47,8 @@ from mediaforge.renaming import (
     RenamePreviewRequest,
     RenameReviewRequest,
     RenameService,
+    RuleInput,
+    RulesDelete,
     RulesUpdate,
 )
 from mediaforge.scrapers import ScraperSettingsUpdate
@@ -309,6 +312,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def file_action(action: FileAction):
         return files.execute(action)
 
+    @app.post("/api/files/delete-batch", dependencies=admin)
+    def delete_files(body: FileDeleteBatch):
+        return files.delete_batch(body)
+
     @app.get("/api/renaming/rules", dependencies=secured)
     def rename_rules():
         return [rule.model_dump() for rule in renaming.rules()]
@@ -316,6 +323,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.put("/api/renaming/rules", dependencies=admin)
     def save_rename_rules(body: RulesUpdate):
         return renaming.save_rules(body)
+
+    @app.post("/api/renaming/rules", dependencies=admin)
+    def add_rename_rule(body: RuleInput):
+        return renaming.add_rule(body)
+
+    @app.post("/api/renaming/rules/delete", dependencies=admin)
+    def delete_rename_rules(body: RulesDelete):
+        return renaming.delete_rules(body)
 
     @app.post("/api/renaming/preview", dependencies=admin)
     def preview_renaming(body: RenamePreviewRequest):
@@ -366,6 +381,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def update_metadata_scrapers(body: ScraperSettingsUpdate):
         return metadata.save_scrapers(body)
 
+    @app.delete("/api/metadata/scrapers/{scraper_id}/key", dependencies=admin)
+    def clear_metadata_key(scraper_id: str):
+        return metadata.clear_scraper_key(scraper_id)
+
     @app.post("/api/metadata/search", dependencies=admin)
     def metadata_search(body: MetadataSearch):
         return metadata.search(body)
@@ -385,6 +404,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.delete("/api/metadata/mappings/{mapping_id}", dependencies=admin)
     def delete_metadata_mapping(mapping_id: str):
         return metadata.delete_mapping(mapping_id)
+
+    @app.post("/api/metadata/mappings/delete", dependencies=admin)
+    def delete_metadata_mappings(body: MetadataMappingsDelete):
+        return metadata.delete_mappings(body)
 
     @app.post("/api/metadata/apply", dependencies=admin)
     def metadata_apply(body: MetadataApply):

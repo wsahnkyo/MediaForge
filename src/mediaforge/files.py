@@ -1,5 +1,6 @@
 import errno
 import json
+import logging
 import os
 import shutil
 import stat
@@ -16,9 +17,22 @@ from pydantic import BaseModel, Field
 from mediaforge.config import Settings, validate_media_targets
 from mediaforge.database import MediaRootSetting, OperationStore, operation_actor
 
+logger = logging.getLogger(__name__)
+
 
 class MediaRootsUpdate(BaseModel):
     roots: list[Annotated[str, Field(min_length=1, max_length=2000)]] = Field(max_length=32)
+    roots_version: str | None = None
+
+
+class FileDeleteBatch(BaseModel):
+    root: int = Field(ge=0)
+    paths: list[Annotated[str, Field(min_length=1, max_length=2000)]] = Field(
+        min_length=1, max_length=1000
+    )
+    roots_version: str = Field(min_length=1, max_length=64)
+    dry_run: bool = True
+    preview_id: str | None = None
 
 
 class FileAction(BaseModel):
@@ -142,6 +156,7 @@ class FileService:
 
     def save_roots(self, request: MediaRootsUpdate, settings: Settings) -> dict[str, Any]:
         with self.lock:
+            self.check_roots_version(request.roots_version)
             roots = []
             for value in request.roots:
                 path = Path(value.strip()).expanduser()
@@ -309,6 +324,78 @@ class FileService:
             target.unlink()
             raise
 
+    def _remember_preview(self, identity: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
+        self.previews = {
+            key: value
+            for key, value in self.previews.items()
+            if time.monotonic() - value.created < 1800
+        }
+        if len(self.previews) >= 50:
+            raise ValueError("未执行的预览过多，请等待旧预览过期")
+        preview_id = uuid4().hex
+        self.previews[preview_id] = FilePreview(
+            identity, plan, self.roots_version, operation_actor.get(), time.monotonic()
+        )
+        return {"dry_run": True, "preview_id": preview_id, **plan}
+
+    def _consume_preview(
+        self, preview_id: str | None, identity: dict[str, Any], plan: dict[str, Any]
+    ) -> None:
+        key = preview_id or ""
+        preview = self.previews.get(key)
+        if (
+            preview is None
+            or time.monotonic() - preview.created >= 1800
+            or preview.actor != operation_actor.get()
+            or preview.roots_version != self.roots_version
+            or preview.request != identity
+            or preview.plan != plan
+        ):
+            raise ValueError("缺少有效预览，或文件 / 操作已变化，请重新预览并确认")
+        del self.previews[key]
+
+    def delete_batch(self, request: FileDeleteBatch) -> dict[str, Any]:
+        with self.lock:
+            self.check_roots_version(request.roots_version)
+            actions = [
+                FileAction(action="delete", root=request.root, path=path) for path in request.paths
+            ]
+            plans = [self._plan(action)[2] for action in actions]
+            if len({os.path.normcase(plan["source"]) for plan in plans}) != len(plans):
+                raise ValueError("不能重复选择同一个文件")
+            identity = {"action": "delete-batch", "root": request.root, "paths": request.paths}
+            plan = {"files": plans, "permanent": True}
+            if request.dry_run:
+                return self._remember_preview(identity, plan)
+            self._consume_preview(request.preview_id, identity, plan)
+
+            def apply() -> dict[str, Any]:
+                results = []
+                for action, expected in zip(actions, plans, strict=True):
+                    row = {"path": action.path, "status": "failed", "error": None}
+                    results.append(row)
+                    try:
+                        source, _, current = self._plan(action)
+                        if current != expected:
+                            raise ValueError("文件在确认后发生变化，未删除")
+                        source.unlink()
+                        row["status"] = "success"
+                    except (OSError, ValueError) as exc:
+                        row["error"] = str(exc)
+                        logger.warning("批量删除失败 path=%s: %s", action.path, exc)
+                deleted = sum(row["status"] == "success" for row in results)
+                return {
+                    "files": results,
+                    "deleted_count": deleted,
+                    "outcome": "success"
+                    if deleted == len(results)
+                    else "partial"
+                    if deleted
+                    else "failed",
+                }
+
+            return self.store.execute("file.delete.batch", request.model_dump(), apply)
+
     def execute(self, request: FileAction) -> dict[str, Any]:
         with self.lock:
             self.check_roots_version(request.roots_version)
@@ -317,31 +404,8 @@ class FileService:
                 exclude={"dry_run", "confirm_delete", "preview_id", "roots_version"}
             )
             if request.dry_run:
-                self.previews = {
-                    key: value
-                    for key, value in self.previews.items()
-                    if time.monotonic() - value.created < 1800
-                }
-                if len(self.previews) >= 50:
-                    raise ValueError("未执行的预览过多，请等待旧预览过期")
-                preview_id = uuid4().hex
-                self.previews[preview_id] = FilePreview(
-                    identity, plan, self.roots_version, operation_actor.get(), time.monotonic()
-                )
-                return {"dry_run": True, "preview_id": preview_id, **plan}
-
-            preview_id = request.preview_id or ""
-            preview = self.previews.get(preview_id)
-            if (
-                preview is None
-                or time.monotonic() - preview.created >= 1800
-                or preview.actor != operation_actor.get()
-                or preview.roots_version != self.roots_version
-                or preview.request != identity
-                or preview.plan != plan
-            ):
-                raise ValueError("缺少有效预览，或文件 / 操作已变化，请重新预览并确认")
-            del self.previews[preview_id]
+                return self._remember_preview(identity, plan)
+            self._consume_preview(request.preview_id, identity, plan)
 
             def apply() -> dict[str, Any]:
                 source, target, current = self._plan(request)

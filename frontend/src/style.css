@@ -107,13 +107,19 @@ p { overflow-wrap: anywhere; }
 .check-control span { overflow-wrap: anywhere; min-width: 0; }
 .check-control.check-danger:has(input:checked) { border-color: #cf9a93; background: #f5e4e1; color: #932d2c; }
 .check-danger input { accent-color: #a93636; }
-.toolbar input:not([type="checkbox"]) { flex: 1; min-width: 160px; }
+.toolbar > input:not([type="checkbox"]) { flex: 1; min-width: 160px; }
 .toolbar > label.directory-field { flex: 1 1 240px; max-width: 560px; }
 .toolbar > label.form-field { flex: 1 1 190px; }
 .toolbar > label.form-field input { width: 100%; min-width: 0; }
 .directory-field select { width: 100%; }
-.toolbar:has(> label:not(:has(input[type="checkbox"]))) { align-items: flex-end; }
+.toolbar:has(> label > select, > label > input:not([type="checkbox"])) { align-items: flex-end; }
+.toolbar select, .toolbar input:not([type="checkbox"]) { height: 40px; font-size: 14px; line-height: 20px; }
+.toolbar > button, .toolbar > .more-actions > summary { line-height: 20px; }
+.toolbar > label.check-control { min-height: 40px; margin: 0; font-size: 14px; line-height: 20px; }
 .panel > .toolbar { padding: 16px; background: #f3f6fa; border: 1px solid #e0e7ef; border-radius: 10px; }
+.video-info-toolbar { display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto; align-items: end; }
+.video-info-toolbar > label.directory-field { max-width: none; }
+.video-info-toolbar select { width: 100%; min-width: 0; }
 .help-details { padding: 11px 14px; border: 1px solid #d2dde6; border-radius: 8px; background: #eaf0f5; color: #425e70; font-size: 13px; }
 .help-details > summary { font-weight: 500; }
 .help-details p:last-child { margin-bottom: 0; }
@@ -225,6 +231,12 @@ td button { font-size: 12px; min-height: 34px; padding: 6px 10px; }
 .folder-picker[open] { display: flex; flex-direction: column; }
 .folder-picker > h2, .folder-picker > .row-actions, .folder-picker > .config-actions { flex-shrink: 0; }
 .folder-picker-body { min-height: 0; overflow-y: auto; margin-top: 12px; }
+.dialog-form { display: flex; flex-direction: column; min-height: 0; }
+.dialog-form > .config-actions { flex-shrink: 0; }
+.selection-actions { margin: 12px 0; }
+.selection-cell { width: 64px; text-align: center; }
+.delete-file-list { padding-left: 22px; overflow-wrap: anywhere; }
+.delete-file-list li { margin-bottom: 10px; }
 .folder-picker .folder-list { max-height: none; overflow: visible; }
 dialog::backdrop { background: #17343d80; }
 .folder-list { display: grid; gap: 8px; max-height: 40vh; overflow-y: auto; margin: 16px 0; }
@@ -281,6 +293,9 @@ footer { text-align: center; font-size: 11px; margin-top: 26px; }
   .toolbar > label.form-field { flex-basis: 100%; }
   .toolbar > button { white-space: normal; max-width: 100%; }
   .toolbar > input:not([type="checkbox"]) { min-width: 0; width: 100%; flex-basis: 100%; }
+  .video-info-toolbar { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .video-info-toolbar > label { grid-column: 1 / -1; }
+  .video-info-toolbar > button, .video-info-toolbar > .more-actions { align-self: start; }
   .section-tabs { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .config-card { padding: 14px; }
   .config-fields { grid-template-columns: minmax(0, 1fr); }

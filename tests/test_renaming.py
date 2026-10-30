@@ -8,6 +8,7 @@ from mediaforge.renaming import (
     RenameReviewRequest,
     RenameService,
     RuleInput,
+    RulesDelete,
     RulesUpdate,
 )
 
@@ -38,15 +39,16 @@ def apply(renaming, report):
     "filename,expected",
     [
         ("Example.2020.S02E03.1080p.x264.mkv", "03.mkv"),
+        ("Example.12.S02E03.mkv", "03.mkv"),
         ("Example - 第04集 - 2160p.mp4", "04.mp4"),
         ("Example.EP05.720p.mp4", "05.mp4"),
-        ("Example.06.1080p.x265.mkv", "06.mkv"),
-        ("7.mkv", "07.mkv"),
+        ("Example.EP06.1080p.x265.mkv", "06.mkv"),
+        ("Show.E7.mkv", "07.mkv"),
         ("Show.EP08.MP4", "08.MP4"),
-        ("Show.09.avi", "09.avi"),
-        ("Show.10.mov", "10.mov"),
-        ("Show.11.m2ts", "11.m2ts"),
-        ("Show.12.ts", "12.ts"),
+        ("Show.EP09.avi", "09.avi"),
+        ("Show.EP10.mov", "10.mov"),
+        ("Show.EP11.m2ts", "11.m2ts"),
+        ("Show.EP12.ts", "12.ts"),
     ],
 )
 def test_priority_extraction_preserves_extension_and_requires_preview(renaming, filename, expected):
@@ -62,7 +64,7 @@ def test_priority_extraction_preserves_extension_and_requires_preview(renaming, 
 
 
 def test_only_current_directory_and_persistent_unchanged_checkpoint(renaming):
-    add(renaming, "Example.01.mkv")
+    add(renaming, "Example.EP01.mkv")
     child = add(renaming, "child/02.mkv")
     result = apply(renaming, preview(renaming))
     assert result["renamed_count"] == 1 and child.exists()
@@ -70,7 +72,7 @@ def test_only_current_directory_and_persistent_unchanged_checkpoint(renaming):
     assert preview(restarted)["unchanged"] is True
     child.write_bytes(b"new child content")
     assert preview(restarted)["unchanged"] is True
-    added = add(restarted, "Example.03.mkv")
+    added = add(restarted, "Example.EP03.mkv")
     report = preview(restarted)
     assert report["ready_count"] == 1
     assert added.exists()
@@ -82,18 +84,18 @@ def test_only_current_directory_and_persistent_unchanged_checkpoint(renaming):
 
 
 def test_editing_preview_revalidates_conflicts_and_old_token_is_invalid(renaming):
-    add(renaming, "Example.01.mkv")
+    add(renaming, "Example.EP01.mkv")
     add(renaming, "02.mkv")
     original = preview(renaming)
     revised = renaming.review(
         RenameReviewRequest(
             preview_id=original["preview_id"],
-            edits=[{"source": "Example.01.mkv", "new_name": "02.mkv"}],
+            edits=[{"source": "Example.EP01.mkv", "new_name": "02.mkv"}],
         )
     )
     assert revised["ready_count"] == 0
     assert (
-        next(row for row in revised["rows"] if row["name"] == "Example.01.mkv")["status"]
+        next(row for row in revised["rows"] if row["name"] == "Example.EP01.mkv")["status"]
         == "conflict"
     )
     with pytest.raises(ValueError, match="预览"):
@@ -103,7 +105,7 @@ def test_editing_preview_revalidates_conflicts_and_old_token_is_invalid(renaming
     validated = renaming.review(
         RenameReviewRequest(
             preview_id=revised["preview_id"],
-            edits=[{"source": "Example.01.mkv", "new_name": "03.mkv"}],
+            edits=[{"source": "Example.EP01.mkv", "new_name": "03.mkv"}],
         )
     )
     apply(renaming, validated)
@@ -112,13 +114,13 @@ def test_editing_preview_revalidates_conflicts_and_old_token_is_invalid(renaming
 
 def test_duplicate_extraction_year_resolution_multi_episode_and_existing_targets(renaming):
     names = [
-        "A.01.mkv",
-        "B.01.mkv",
+        "A.EP01.mkv",
+        "B.EP01.mkv",
         "2020.1080p.x264.mkv",
         "A.02.03.mkv",
         "A.S01E04-E05.mkv",
         "A.EP07-08.mkv",
-        "A.06.mkv",
+        "A.EP06.mkv",
         "06.mkv",
     ]
     for name in names:
@@ -130,7 +132,7 @@ def test_duplicate_extraction_year_resolution_multi_episode_and_existing_targets
 
 
 def test_rules_database_persistence_invalidation_and_numeric_template(renaming):
-    add(renaming, "Example.01.mkv")
+    add(renaming, "Example.EP01.mkv")
     old = preview(renaming)
     rules = renaming.rules()
     for rule in rules:
@@ -146,6 +148,110 @@ def test_rules_database_persistence_invalidation_and_numeric_template(renaming):
     rules[0].name = "Updated rule"
     restarted.save_rules(RulesUpdate(rules=rules))
     assert preview(restarted)["unchanged"] is False
+
+
+def test_fresh_install_general_rule_works_without_database_seed(renaming):
+    with renaming.store.sessions() as session:
+        assert session.get(RenameRule, "general-episode") is None
+    assert [rule.id for rule in renaming.rules()] == ["general-episode"]
+    add(renaming, "ExampleEP0007.mkv")
+    report = preview(renaming)
+    row = report["rows"][0]
+    assert row["rule"] == "通用规则" and row["new_name"] == "07.mkv"
+    restarted = RenameService(renaming.files, renaming.store)
+    assert preview(restarted)["rows"][0]["new_name"] == "07.mkv"
+    apply(restarted, preview(restarted))
+    assert (renaming.files.roots[0] / "07.mkv").read_bytes() == b"video"
+
+
+def test_default_does_not_fall_back_to_removed_numeric_rules(renaming):
+    for name in ("7.mkv", "Show.06.1080p.mkv"):
+        add(renaming, name)
+    report = preview(renaming)
+    assert report["ready_count"] == 0
+    assert all(row["status"] == "skipped" for row in report["rows"])
+
+
+def test_general_default_does_not_change_existing_saved_rules(renaming):
+    custom = RuleInput(id="custom", name="Custom", pattern=r"EP(?P<episode>\d+)")
+    renaming.save_rules(RulesUpdate(rules=[custom]))
+    restarted = RenameService(renaming.files, renaming.store)
+    assert restarted.rules() == [custom]
+    add(renaming, "ExampleEP0007.mkv")
+    assert preview(restarted)["rows"][0]["rule"] == "Custom"
+
+
+@pytest.mark.parametrize(
+    "old_template", ["{episode:03d}", "Episode-{episode}", "S{season:02d}E{episode:02d}"]
+)
+def test_existing_custom_templates_use_fixed_two_digit_names_without_migration(
+    renaming, old_template
+):
+    with renaming.store.sessions() as session:
+        session.add(
+            RenameRule(
+                id="legacy",
+                name="Legacy",
+                pattern=r"EP(?P<episode>\d+)",
+                template=old_template,
+                enabled=True,
+                priority=0,
+            )
+        )
+        session.commit()
+    add(renaming, "Show.EP1.mkv")
+    add(renaming, "Show.EP12.mp4")
+    report = preview(renaming)
+    assert {row["new_name"] for row in report["rows"]} == {"01.mkv", "12.mp4"}
+    apply(renaming, report)
+    assert (renaming.files.roots[0] / "01.mkv").exists()
+    assert (renaming.files.roots[0] / "12.mp4").exists()
+    with renaming.store.sessions() as session:
+        assert session.get(RenameRule, "legacy").template == old_template
+    renaming.save_rules(RulesUpdate(rules=renaming.rules()))
+    with renaming.store.sessions() as session:
+        assert session.get(RenameRule, "legacy").template == "{episode:02d}"
+
+
+def test_granular_rules_persist_without_replacing_other_saved_edits(renaming):
+    renaming.add_rule(RuleInput(id="extra", name="Extra", pattern=r"EP(?P<episode>\d+)"))
+    rules = renaming.rules()
+    rules[0].name = "Saved custom name"
+    for index, rule in enumerate(rules):
+        rule.priority = 10 + index
+    renaming.save_rules(RulesUpdate(rules=rules))
+    add(renaming, "Example.EP01.mkv")
+    old_preview = preview(renaming)
+    created = RuleInput(id="added", name="Added", pattern=r"(?P<episode>\d+)")
+    result = renaming.add_rule(created)
+    assert result["rules"][-1]["id"] == "added"
+    assert result["rules"][0]["name"] == "Saved custom name"
+    assert old_preview["preview_id"] not in renaming.previews
+    with pytest.raises(ValueError, match="重复"):
+        renaming.add_rule(created)
+    removed = [rules[1].id, created.id]
+    result = renaming.delete_rules(RulesDelete(ids=removed))
+    expected_ids = [rule.id for rule in rules if rule.id not in removed]
+    assert [rule["id"] for rule in result["rules"]] == expected_ids
+    restarted = RenameService(renaming.files, renaming.store)
+    assert [rule.model_dump() for rule in restarted.rules()] == result["rules"]
+    with pytest.raises(ValueError, match="不存在"):
+        restarted.delete_rules(RulesDelete(ids=removed))
+    assert len(restarted.rules()) == len(expected_ids)
+
+
+@pytest.mark.parametrize("kind", ["duplicate", "missing", "all"])
+def test_invalid_rule_bulk_deletion_is_atomic(renaming, kind):
+    rules = renaming.rules()
+    renaming.save_rules(RulesUpdate(rules=rules))
+    ids = {
+        "duplicate": [rules[0].id, rules[0].id],
+        "missing": [rules[0].id, "missing"],
+        "all": [rule.id for rule in rules],
+    }[kind]
+    with pytest.raises(ValueError):
+        renaming.delete_rules(RulesDelete(ids=ids))
+    assert renaming.rules() == rules
 
 
 @pytest.mark.parametrize("first_pattern", [r"part(?P<episode>\d+)", r"(?P<episode>\d+)"])
@@ -200,11 +306,11 @@ def test_invalid_rules_are_rejected_without_replacing_saved_rules(renaming, fiel
     invalid = rules[0].model_copy(update={field: value})
     with pytest.raises(ValueError):
         renaming.save_rules(RulesUpdate(rules=[invalid]))
-    assert len(renaming.rules()) == 3
+    assert len(renaming.rules()) == len(rules)
 
 
 def test_nfo_and_language_subtitles_follow_video_in_same_preview(renaming):
-    for name in ("Show.01.mkv", "Show.01.nfo", "Show.01.zh-CN.srt"):
+    for name in ("Show.EP01.mkv", "Show.EP01.nfo", "Show.EP01.zh-CN.srt"):
         add(renaming, name, name.encode())
     report = preview(renaming)
     assert report["file_count"] == 3
@@ -312,8 +418,8 @@ def test_manual_preview_edits_cannot_escape_or_change_extension(renaming, name):
 
 
 def test_failed_companion_move_rolls_back_video_and_keeps_retry_possible(renaming, monkeypatch):
-    add(renaming, "Show.01.mkv")
-    add(renaming, "Show.01.nfo")
+    add(renaming, "Show.EP01.mkv")
+    add(renaming, "Show.EP01.nfo")
     report = preview(renaming)
     move = renaming.files._move
 
@@ -325,8 +431,8 @@ def test_failed_companion_move_rolls_back_video_and_keeps_retry_possible(renamin
     monkeypatch.setattr(renaming.files, "_move", fail_nfo)
     result = apply(renaming, report)
     assert result["outcome"] == "partial"
-    assert (renaming.files.roots[0] / "Show.01.mkv").exists()
-    assert (renaming.files.roots[0] / "Show.01.nfo").exists()
+    assert (renaming.files.roots[0] / "Show.EP01.mkv").exists()
+    assert (renaming.files.roots[0] / "Show.EP01.nfo").exists()
     assert not preview(renaming)["unchanged"]
 
 

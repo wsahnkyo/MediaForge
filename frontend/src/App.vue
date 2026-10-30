@@ -64,13 +64,12 @@ interface VideoInfoStatus {
   summary: { analyzed?: number; cached?: number; deferred?: number; failed?: number };
 }
 interface FileRequest {
-  action: "rename" | "move" | "delete";
+  action: "rename" | "move";
   root: number;
   path: string;
   destination_root: number;
   destination: string;
   dry_run: boolean;
-  confirm_delete?: string;
   roots_version?: string;
   preview_id?: string;
 }
@@ -81,6 +80,15 @@ interface FilePlan {
   size: number;
   modified_ns: number;
   permanent: boolean;
+}
+interface DeleteFilesPreview {
+  preview_id: string;
+  files: { source: string; size: number }[];
+}
+interface DeleteFilesResult {
+  deleted_count: number;
+  outcome: "success" | "partial" | "failed";
+  files: { path: string; status: "success" | "failed"; error: string | null }[];
 }
 interface RenameRule {
   id: string; name: string; pattern: string; template: string;
@@ -202,7 +210,6 @@ interface ScraperConfig {
   configured: boolean;
   key_source: "database" | "environment" | "none";
   api_key: string;
-  clear_api_key: boolean;
 }
 interface MetadataPlan {
   preview_id: string;
@@ -224,9 +231,8 @@ const password = ref("");
 const currentUser = ref<User | null>(null);
 const isAdmin = computed(() => currentUser.value?.role === "admin");
 const config = ref<Config | null>(null);
-const mediaRootsDraft = ref<string[]>([]);
-const mediaRootsDirty = computed(() => JSON.stringify(mediaRootsDraft.value)
-  !== JSON.stringify(config.value?.roots.map(item => item.path) ?? []));
+const mediaRootsDraft = computed(() => config.value?.roots.map(item => item.path) ?? []);
+const selectedRootPaths = ref<string[]>([]);
 const mediaFolderListing = ref<MediaFolderListing | null>(null);
 const mediaFolderError = ref("");
 const mediaFolderDialog = ref<HTMLDialogElement | null>(null);
@@ -297,7 +303,13 @@ const selected = ref<FileEntry | null>(null);
 const action = ref<FileRequest["action"]>("rename");
 const destinationRoot = ref(0);
 const destination = ref("");
-const deleteName = ref("");
+const selectedFilePaths = ref<string[]>([]);
+const deletableFiles = computed(() => entries.value.filter(file => !file.directory && !file.blocked));
+const fileDeleteDialog = ref<HTMLDialogElement | null>(null);
+const fileDeletePreview = ref<DeleteFilesPreview | null>(null);
+const fileDeleteRequest = ref<{ root: number; paths: string[]; roots_version: string; preview_id: string } | null>(null);
+const fileDeleteError = ref("");
+const fileDeleteResult = ref<DeleteFilesResult | null>(null);
 const plan = ref<FilePlan | null>(null);
 const plannedRequest = ref<FileRequest | null>(null);
 const hostReport = ref<HostReport | null>(null);
@@ -341,6 +353,7 @@ const metadataOverwrite = ref(false);
 const metadataPlan = ref<MetadataPlan | null>(null);
 const metadataResult = ref<MetadataResult | null>(null);
 const metadataMappings = ref<MetadataMapping[]>([]);
+const selectedMappingIds = ref<string[]>([]);
 const metadataTarget = ref<{ name: string; path: string } | null>(null);
 const metadataMappingId = ref<number | string>("");
 const metadataMappingPanel = ref<HTMLDetailsElement | null>(null);
@@ -351,6 +364,9 @@ const metadataSearchPanel = ref<HTMLElement | null>(null);
 const metadataCleanupReport = ref<MetadataCleanupReport | null>(null);
 const renameRules = ref<RenameRule[]>([]);
 const savedRenameRules = ref("");
+const selectedRuleIds = ref<string[]>([]);
+const newRuleDialog = ref<HTMLDialogElement | null>(null);
+const newRule = ref<RenameRule>({ id: "", name: "", pattern: "", template: "{episode:02d}", enabled: true, priority: 0 });
 const renameRulesDirty = computed(() => JSON.stringify(renameRules.value) !== savedRenameRules.value);
 const renameRoot = ref(-1);
 const renameDirectory = ref("");
@@ -435,6 +451,7 @@ async function run(work: () => Promise<void>) {
 async function loadFiles() {
   clearPlan();
   selected.value = null;
+  selectedFilePaths.value = [];
   if (!config.value?.roots.length) { entries.value = []; return; }
   const data = await api<{ entries: FileEntry[] }>(
     `/files?root=${root.value}&path=${encodeURIComponent(directory.value)}&roots_version=${config.value.roots_version}`,
@@ -442,18 +459,19 @@ async function loadFiles() {
   entries.value = data.entries;
 }
 
-function clearPlan() { plan.value = null; plannedRequest.value = null; deleteName.value = ""; }
+function clearPlan() { plan.value = null; plannedRequest.value = null; }
 function choose(file: FileEntry) {
   clearPlan();
   selected.value = file;
   destination.value = file.name;
 }
-async function enter(path: string) { directory.value = path; await loadFiles(); }
+async function enter(path: string) { directory.value = path; fileDeleteResult.value = null; await loadFiles(); }
 
-async function loadWorkspace() {
+async function loadWorkspace(reloadEditors = true) {
   config.value = await api<Config>("/config");
-  mediaRootsDraft.value = config.value.roots.map(item => item.path);
-  hostSource.value = config.value.hosts_source;
+  selectedRootPaths.value = [];
+  fileDeleteResult.value = null; fileDeletePreview.value = null; fileDeleteRequest.value = null;
+  if (reloadEditors) hostSource.value = config.value.hosts_source;
   root.value = config.value.roots[0]?.id ?? 0;
   metadataRoot.value = -1;
   renameRoot.value = -1; renameDirectory.value = "";
@@ -470,7 +488,8 @@ async function loadWorkspace() {
   videoInfoRows.value = [];
   connected.value = true;
   await loadRecords();
-  await Promise.all([loadMetadataMappings(), loadScrapers(), loadFiles(), loadRenameRules(), loadVideoStatus()]);
+  await Promise.all([loadMetadataMappings(), loadFiles(), loadVideoStatus(),
+    ...(reloadEditors ? [loadScrapers(), loadRenameRules()] : [])]);
 }
 
 function bitrate(value: number | null | undefined) {
@@ -555,15 +574,16 @@ watch([tab, connected], () => {
   if (videoPollingEnabled) void pollVideoStatus();
 });
 
-async function saveMediaRoots() {
-  const roots = [...mediaRootsDraft.value];
-  if (!window.confirm("保存媒体目录配置？旧的文件操作及刮削预览将失效。移除目录只取消访问，不删除文件或关联记录。")) return;
-  await run(async () => {
-    await api("/config/media-roots", { roots }, "PUT");
-    clearPlan(); selected.value = null;
-    await loadWorkspace();
-    notice.value = "媒体目录已保存到数据库并立即生效，无需重启。请选择目录后重新预览。";
-  });
+async function saveMediaRoots(roots: string[]) {
+  await api("/config/media-roots", { roots, roots_version: config.value?.roots_version }, "PUT");
+  clearPlan(); selected.value = null;
+  await loadWorkspace(false);
+  notice.value = "媒体目录已更新并立即生效；旧预览已失效。";
+}
+async function removeMediaRoots(paths: string[]) {
+  if (!paths.length || !window.confirm(`移除以下 ${paths.length} 个媒体目录？\n${paths.join("\n")}\n只取消访问，不删除磁盘文件。`)) return;
+  const removed = new Set(paths);
+  await run(() => saveMediaRoots(mediaRootsDraft.value.filter(path => !removed.has(path))));
 }
 
 async function browseMediaFolders(path?: string | null) {
@@ -585,11 +605,19 @@ async function openMediaFolderDialog() {
   mediaFolderDialog.value?.showModal();
   await browseMediaFolders();
 }
-function addMediaFolder() {
+async function addMediaFolder() {
   const listing = mediaFolderListing.value;
   if (!listing?.path || !listing.selectable || mediaFolderError.value || mediaFolderAlreadyAdded.value || mediaRootsDraft.value.length >= 32) return;
-  mediaRootsDraft.value.push(listing.path);
-  mediaFolderDialog.value?.close();
+  const path = listing.path;
+  await run(async () => {
+    try {
+      await saveMediaRoots([...mediaRootsDraft.value, path]);
+      mediaFolderDialog.value?.close();
+    } catch (cause) {
+      mediaFolderError.value = cause instanceof Error ? cause.message : String(cause);
+      throw cause;
+    }
+  });
 }
 
 async function login() {
@@ -608,7 +636,9 @@ async function logout() {
     connected.value = false;
     currentUser.value = null;
     config.value = null;
-    mediaRootsDraft.value = []; mediaFolderListing.value = null; mediaFolderError.value = "";
+    selectedRootPaths.value = []; mediaFolderListing.value = null; mediaFolderError.value = "";
+    selectedFilePaths.value = []; fileDeletePreview.value = null; fileDeleteRequest.value = null; fileDeleteResult.value = null;
+    selectedRuleIds.value = []; selectedMappingIds.value = [];
     entries.value = []; records.value = []; users.value = [];
     recordsVersion.value++; operationDetails.value = {};
     runtimeLog.value = null;
@@ -656,14 +686,45 @@ async function preview() {
 
 async function execute() {
   if (!plannedRequest.value || !plan.value) return;
-  const request = { ...plannedRequest.value, dry_run: false, confirm_delete: deleteName.value };
-  if (!window.confirm(`确认${request.action === "delete" ? "永久删除" : "执行文件操作"}？\n${plan.value.source}${plan.value.destination ? `\n→ ${plan.value.destination}` : ""}`)) return;
+  const request = { ...plannedRequest.value, dry_run: false };
+  if (!window.confirm(`确认执行文件操作？\n${plan.value.source}${plan.value.destination ? `\n→ ${plan.value.destination}` : ""}`)) return;
   await run(async () => {
     // Discard the plan before sending a mutation: network errors must not encourage replay.
     clearPlan();
     await api("/files/action", request);
     await loadFiles();
     notice.value = "操作已完成，并已记录到 PostgreSQL。";
+  });
+}
+
+async function confirmFileDeletion(paths: string[]) {
+  await run(async () => {
+    if (!config.value || !paths.length) throw new Error("请先选择需要删除的文件。");
+    const request = { root: root.value, paths: [...paths], roots_version: config.value.roots_version };
+    fileDeleteError.value = ""; fileDeletePreview.value = null; fileDeleteRequest.value = null;
+    const preview = await api<DeleteFilesPreview>("/files/delete-batch", { ...request, dry_run: true });
+    fileDeletePreview.value = preview;
+    fileDeleteRequest.value = { ...request, preview_id: preview.preview_id };
+    await nextTick();
+    fileDeleteDialog.value?.showModal();
+  });
+}
+async function deleteFiles() {
+  const request = fileDeleteRequest.value;
+  if (!request) return;
+  await run(async () => {
+    fileDeleteRequest.value = null;
+    fileDeleteResult.value = null;
+    try {
+      fileDeleteResult.value = await api<DeleteFilesResult>("/files/delete-batch", { ...request, dry_run: false });
+    } catch (cause) {
+      fileDeleteError.value = `${cause instanceof Error ? cause.message : String(cause)}。请关闭弹窗并刷新列表核对，不要直接重复删除。`;
+      throw cause;
+    }
+    fileDeleteDialog.value?.close();
+    await loadFiles();
+    noticeTone.value = fileDeleteResult.value.outcome === "success" ? "success" : "warning";
+    notice.value = `删除完成：成功 ${fileDeleteResult.value.deleted_count} 个，失败 ${fileDeleteResult.value.files.length - fileDeleteResult.value.deleted_count} 个。`;
   });
 }
 
@@ -677,12 +738,54 @@ watch(() => JSON.stringify(renameRules.value), () => {
 async function loadRenameRules() {
   renameRules.value = await api<RenameRule[]>("/renaming/rules");
   savedRenameRules.value = JSON.stringify(renameRules.value);
+  selectedRuleIds.value = [];
 }
-function addRenameRule() {
-  renameRules.value.push({
+async function addRenameRule() {
+  error.value = "";
+  newRule.value = {
     id: crypto.randomUUID(), name: "新规则", pattern: "(?P<episode>\\d{1,3})",
     template: "{episode:02d}", enabled: true,
     priority: renameRules.value.length,
+  };
+  await nextTick();
+  newRuleDialog.value?.showModal();
+}
+function mergeRenameRules(data: RenameRule[]) {
+  const baseline: RenameRule[] = JSON.parse(savedRenameRules.value || "[]");
+  const drafts = new Map(renameRules.value.map(item => [item.id, item]));
+  const previous = new Map(baseline.map(item => [item.id, item]));
+  const byId = new Map(data.map(item => [item.id, item]));
+  const orderChanged = JSON.stringify(renameRules.value.map(item => item.id)) !== JSON.stringify(baseline.map(item => item.id));
+  const ordered = orderChanged
+    ? [...renameRules.value.flatMap(item => { const saved = byId.get(item.id); return saved ? [saved] : []; }), ...data.filter(item => !drafts.has(item.id))]
+    : data;
+  renameRules.value = ordered.map((item, priority) => {
+    const draft = drafts.get(item.id), saved = previous.get(item.id);
+    if (!draft || !saved) return { ...item, priority };
+    return {
+      ...item, priority,
+      name: draft.name !== saved.name ? draft.name : item.name,
+      pattern: draft.pattern !== saved.pattern ? draft.pattern : item.pattern,
+      enabled: draft.enabled !== saved.enabled ? draft.enabled : item.enabled,
+    };
+  });
+  savedRenameRules.value = JSON.stringify(data);
+  selectedRuleIds.value = selectedRuleIds.value.filter(id => byId.has(id));
+}
+async function createRenameRule() {
+  await run(async () => {
+    const result = await api<{ rules: RenameRule[] }>("/renaming/rules", newRule.value);
+    mergeRenameRules(result.rules);
+    newRuleDialog.value?.close();
+    notice.value = "规则已新增并立即生效；其他未保存的编辑已保留。";
+  });
+}
+async function deleteRenameRules(ids: string[]) {
+  if (!ids.length || !window.confirm(`删除选中的 ${ids.length} 条命名规则？\n不会改动媒体文件，其他未保存的编辑将保留。`)) return;
+  await run(async () => {
+    const result = await api<{ rules: RenameRule[] }>("/renaming/rules/delete", { ids: [...ids] });
+    mergeRenameRules(result.rules);
+    notice.value = `已删除 ${ids.length} 条规则，立即生效。`;
   });
 }
 function moveRenameRule(index: number, direction: number) {
@@ -765,7 +868,7 @@ watch(() => selectedScrapers.value.join(","), () => {
 watch([metadataRoot, metadataDirectory], () => {
   metadataTarget.value = null; metadataMappingId.value = ""; metadataSearchReport.value = null;
 });
-watch(metadataType, () => { metadataMappingId.value = ""; });
+watch(metadataType, () => { metadataMappingId.value = ""; selectedMappingIds.value = []; });
 watch([metadataType, metadataLanguage, metadataSearchName], () => {
   metadataSearchReport.value = null;
 });
@@ -784,8 +887,8 @@ async function searchMetadata(page = 1) {
 }
 
 async function loadScrapers() {
-  const data = await api<Omit<ScraperConfig, "api_key" | "clear_api_key">[]>("/metadata/scrapers");
-  scrapers.value = data.map(item => ({ ...item, api_key: "", clear_api_key: false }));
+  const data = await api<Omit<ScraperConfig, "api_key">[]>("/metadata/scrapers");
+  scrapers.value = data.map(item => ({ ...item, api_key: "" }));
   savedScrapers.value = scrapers.value.map(item => ({ ...item }));
   if (config.value) config.value.tmdb_key_configured = data.some(item => item.id === "tmdb" && item.configured);
 }
@@ -819,8 +922,7 @@ async function saveScrapers() {
       await api("/metadata/scrapers", {
         scrapers: scrapers.value.map(item => ({
           id: item.id, enabled: item.enabled, priority: item.priority,
-          clear_api_key: item.clear_api_key,
-          ...(!item.clear_api_key && item.api_key ? { api_key: item.api_key } : {}),
+          ...(item.api_key ? { api_key: item.api_key } : {}),
         })),
       }, "PUT");
       metadataPlan.value = null; metadataResult.value = null; metadataSearchReport.value = null;
@@ -831,20 +933,37 @@ async function saveScrapers() {
   });
 }
 
+async function clearScraperKey(scraper: ScraperConfig) {
+  if (!window.confirm(`立即清除 ${scraper.name} Key？需要重新填写并保存后才能使用该刮削器。其他未保存的编辑将保留。`)) return;
+  await run(async () => {
+    const drafts = new Map(scrapers.value.map(item => [item.id, { ...item }]));
+    const baseline = new Map(savedScrapers.value.map(item => [item.id, item]));
+    await api(`/metadata/scrapers/${scraper.id}/key`, undefined, "DELETE");
+    scraper.api_key = "";
+    metadataPlan.value = null; metadataResult.value = null; metadataSearchReport.value = null;
+    metadataCleanupReport.value = null;
+    await loadScrapers();
+    scrapers.value = scrapers.value.map(item => {
+      const draft = drafts.get(item.id), saved = baseline.get(item.id);
+      if (!draft || !saved) return item;
+      return {
+        ...item,
+        enabled: draft.enabled !== saved.enabled ? draft.enabled : item.enabled,
+        priority: draft.priority !== saved.priority ? draft.priority : item.priority,
+        api_key: item.id === scraper.id ? "" : draft.api_key,
+      };
+    });
+    notice.value = `${scraper.name} Key 已清除并立即生效，其他编辑未提交。`;
+  });
+}
+
 async function chooseMetadataCandidate(candidate: MetadataCandidate) {
   if (candidate.scraper_id !== "tmdb") {
     error.value = "当前目录手动关联使用 TMDB 主标识，请选择 TMDB 候选；其他来源参与信息补全。";
     return;
   }
   metadataMappingId.value = candidate.id;
-  metadataPlan.value = null; metadataResult.value = null;
-  openConfiguration("mappings");
-  await nextTick();
-  if (metadataMappingPanel.value) {
-    metadataMappingPanel.value.open = true;
-    metadataMappingPanel.value.scrollIntoView({ behavior: "smooth", block: "nearest" });
-  }
-  notice.value = `已选择 ${candidate.name || candidate.title} · TMDB ${candidate.id}，请核对已选文件夹后保存关联。`;
+  await saveMetadataMapping(metadataTarget.value?.path, candidate.id);
 }
 
 async function selectMetadataFolder(name: string, path: string) {
@@ -879,6 +998,7 @@ async function editMetadataMapping(mapping: MetadataMapping) {
 
 async function loadMetadataMappings() {
   metadataMappings.value = await api<MetadataMapping[]>("/metadata/mappings");
+  selectedMappingIds.value = selectedMappingIds.value.filter(id => metadataMappings.value.some(item => item.id === id));
 }
 
 async function saveMetadataMapping(path: string | undefined, value: number | string | undefined) {
@@ -898,10 +1018,10 @@ async function saveMetadataMapping(path: string | undefined, value: number | str
   });
 }
 
-async function deleteMetadataMapping(mapping: MetadataMapping) {
-  if (!window.confirm(`删除“${mapping.folder_name}”的手动映射？之后恢复自动搜索，不删除媒体文件。`)) return;
+async function deleteMetadataMappings(ids: string[]) {
+  if (!ids.length || !window.confirm(`解除选中的 ${ids.length} 条影视关联？之后恢复自动搜索，不删除媒体文件。`)) return;
   await run(async () => {
-    await api(`/metadata/mappings/${mapping.id}`, undefined, "DELETE");
+    await api("/metadata/mappings/delete", { ids: [...ids] });
     metadataPlan.value = null; metadataResult.value = null;
     await loadMetadataMappings();
     metadataCleanupReport.value = null;
@@ -1228,21 +1348,24 @@ async function changePassword() {
       </section>
       <section v-if="isAdmin && tab === 'configuration' && configurationSection === 'roots'" class="panel">
         <h2>媒体目录</h2>
-        <form @submit.prevent="saveMediaRoots">
+        <div>
           <div class="config-section-heading">
-            <p class="help-text">选择允许访问的媒体目录；移出列表不会删除文件。</p>
+            <p class="help-text">新增、移除立即生效，无需再次保存；移除不会删除磁盘文件。</p>
             <button type="button" :disabled="busy || mediaRootsDraft.length >= 32" @click="openMediaFolderDialog">添加文件夹</button>
           </div>
-          <div class="table-wrap"><table><thead><tr><th>已选择的媒体目录（{{ mediaRootsDraft.length }} / 32）</th><th>操作</th></tr></thead><tbody>
-            <tr v-for="(path, index) in mediaRootsDraft" :key="path"><td><strong>{{ folderName(path) }}</strong><p class="path-caption"><code>{{ path }}</code></p></td><td><button type="button" :disabled="busy" @click="mediaRootsDraft.splice(index, 1)">移出列表</button></td></tr>
-            <tr v-if="!mediaRootsDraft.length"><td colspan="2">尚未选择目录，请点击“添加文件夹”。</td></tr>
-          </tbody></table></div>
-          <div class="config-actions">
-            <span class="help-text" role="status">{{ mediaRootsDirty ? "有未保存的修改" : "修改目录后需保存生效" }}</span>
-            <button class="primary" :disabled="busy">保存目录</button>
+          <div class="row-actions selection-actions">
+            <label class="check-control"><input type="checkbox" :checked="!!mediaRootsDraft.length && selectedRootPaths.length === mediaRootsDraft.length" :disabled="busy || !mediaRootsDraft.length" @change="selectedRootPaths = selectedRootPaths.length === mediaRootsDraft.length ? [] : [...mediaRootsDraft]" /><span>全选目录</span></label>
+            <button type="button" class="danger-button" :disabled="busy || !selectedRootPaths.length" @click="removeMediaRoots(selectedRootPaths)">批量移除（{{ selectedRootPaths.length }}）</button>
           </div>
-        </form>
-        <dialog ref="mediaFolderDialog" class="folder-picker" aria-labelledby="folder-picker-title">
+          <div class="table-wrap"><table><thead><tr><th class="selection-cell">选择</th><th>已保存的媒体目录（{{ mediaRootsDraft.length }} / 32）</th><th>操作</th></tr></thead><tbody>
+            <tr v-for="path in mediaRootsDraft" :key="path">
+              <td class="selection-cell"><input v-model="selectedRootPaths" type="checkbox" :value="path" :disabled="busy" :aria-label="`选择目录 ${path}`" /></td>
+              <td><strong>{{ folderName(path) }}</strong><p class="path-caption"><code>{{ path }}</code></p></td><td><button type="button" class="danger-button" :disabled="busy" @click="removeMediaRoots([path])">移除目录</button></td>
+            </tr>
+            <tr v-if="!mediaRootsDraft.length"><td colspan="3">尚未选择目录，请点击“添加文件夹”。</td></tr>
+          </tbody></table></div>
+        </div>
+        <dialog ref="mediaFolderDialog" class="folder-picker" aria-labelledby="folder-picker-title" @cancel="busy && $event.preventDefault()">
           <h2 id="folder-picker-title">选择媒体文件夹</h2>
           <div class="row-actions">
             <button :disabled="busy" @click="browseMediaFolders()">磁盘列表</button>
@@ -1259,7 +1382,7 @@ async function changePassword() {
             <p v-if="!mediaFolderListing.entries.length">无子文件夹</p>
           </div>
           <p v-if="mediaFolderListing?.reason" class="warning">{{ mediaFolderListing.reason }}；可继续进入子文件夹。</p>
-          <p v-if="mediaFolderAlreadyAdded" class="message">此文件夹已在待保存列表中。</p>
+          <p v-if="mediaFolderAlreadyAdded" class="message">此文件夹已添加。</p>
           </div>
           <div class="config-actions">
             <button :disabled="busy" @click="mediaFolderDialog?.close()">取消</button>
@@ -1270,7 +1393,7 @@ async function changePassword() {
       <section v-if="tab === 'files'" class="panel">
         <h2>媒体文件</h2>
         <div v-if="!config.roots.length" class="message">
-          尚未配置媒体目录，请由管理员在“配置管理”中选择文件夹并保存。
+          尚未配置媒体目录，请由管理员在“配置管理”中添加文件夹。
           <a v-if="isAdmin" href="#configuration">前往配置管理</a>
         </div>
         <template v-else>
@@ -1283,39 +1406,58 @@ async function changePassword() {
             <button v-if="isAdmin" :disabled="busy" @click="openRenaming">批量重命名</button>
           </div>
           <p class="path-caption"><code>{{ rootPath(root) }}{{ directory ? "\\" + directory : "" }}</code></p>
+          <div v-if="isAdmin" class="row-actions selection-actions">
+            <label class="check-control"><input type="checkbox" :checked="!!deletableFiles.length && deletableFiles.slice(0, 1000).every(file => selectedFilePaths.includes(file.path))" :disabled="busy || !deletableFiles.length" @change="selectedFilePaths = deletableFiles.slice(0, 1000).every(file => selectedFilePaths.includes(file.path)) ? [] : deletableFiles.slice(0, 1000).map(file => file.path)" /><span>{{ deletableFiles.length > 1000 ? "选择前 1000 个文件" : "全选文件" }}</span></label>
+            <button class="danger-button" :disabled="busy || !selectedFilePaths.length" @click="confirmFileDeletion(selectedFilePaths)">批量删除（{{ selectedFilePaths.length }}）</button>
+            <span class="help-text">仅删除普通文件，不删除目录；每次最多 1000 个。</span>
+          </div>
+          <details v-if="fileDeleteResult" :open="fileDeleteResult.outcome !== 'success'" class="preview">
+            <summary>删除结果：成功 {{ fileDeleteResult.deleted_count }} 个，失败 {{ fileDeleteResult.files.length - fileDeleteResult.deleted_count }} 个</summary>
+            <p v-for="file in fileDeleteResult.files" :key="file.path" :class="{ danger: file.status === 'failed' }"><code>{{ file.path }}</code>：{{ file.status === "success" ? "已删除" : file.error }}</p>
+          </details>
           <div class="table-wrap">
-            <table><thead><tr><th>名称</th><th>类型</th><th>大小</th></tr></thead>
+            <table><thead><tr><th v-if="isAdmin" class="selection-cell">选择</th><th>名称</th><th>类型</th><th>大小</th><th v-if="isAdmin">操作</th></tr></thead>
               <tbody><tr v-for="file in entries" :key="file.path" :class="{ selected: selected?.path === file.path }">
+                <td v-if="isAdmin" class="selection-cell"><input v-if="!file.directory && !file.blocked" v-model="selectedFilePaths" type="checkbox" :value="file.path" :disabled="busy || (selectedFilePaths.length >= 1000 && !selectedFilePaths.includes(file.path))" :aria-label="`选择文件 ${file.name}`" /></td>
                 <td><button class="link" :disabled="busy || file.blocked" @click="file.directory ? run(() => enter(file.path)) : choose(file)">{{ file.name }}</button></td>
                 <td>{{ file.blocked ? "链接（禁止操作）" : file.directory ? "目录" : "文件" }}</td>
                 <td>{{ file.directory ? "—" : (file.size / 1024 / 1024).toFixed(2) + " MB" }}</td>
-              </tr><tr v-if="!entries.length"><td colspan="3">目录为空</td></tr></tbody>
+                <td v-if="isAdmin"><button v-if="!file.directory && !file.blocked" class="danger-button" :disabled="busy" :aria-label="`删除文件 ${file.name}`" @click="confirmFileDeletion([file.path])">删除</button></td>
+              </tr><tr v-if="!entries.length"><td :colspan="isAdmin ? 5 : 3">目录为空</td></tr></tbody>
             </table>
           </div>
           <div v-if="selected && isAdmin" class="action-box">
             <h3>已选择：{{ selected.name }}</h3>
             <div class="toolbar">
               <select v-model="action" :disabled="busy" aria-label="文件操作" @change="clearPlan">
-                <option value="rename">重命名</option><option value="move">移动</option><option value="delete">永久删除</option>
+                <option value="rename">重命名</option><option value="move">移动</option>
               </select>
               <select v-if="action === 'move'" v-model.number="destinationRoot" :disabled="busy" aria-label="目标目录" @change="clearPlan">
                 <option v-for="item in config.roots" :key="item.id" :value="item.id" :title="item.path">{{ rootLabel(item.path) }}</option>
               </select>
-              <input v-if="action !== 'delete'" v-model="destination" :disabled="busy" :placeholder="action === 'rename' ? '新文件名（含扩展名）' : '目标相对路径（含文件名，父目录需存在）'" @input="clearPlan" />
+              <input v-model="destination" :disabled="busy" :placeholder="action === 'rename' ? '新文件名（含扩展名）' : '目标相对路径（含文件名，父目录需存在）'" @input="clearPlan" />
               <button class="primary" :disabled="busy" @click="preview">预览操作</button>
             </div>
             <p v-if="!isAdmin">当前为只读账号，可浏览目录，不能执行文件修改。</p>
             <div v-if="plan" class="preview">
               <p>来源：<code>{{ plan.source }}</code></p>
               <p v-if="plan.destination">目标：<code>{{ plan.destination }}</code></p>
-              <template v-if="plan.permanent">
-                <p class="danger">永久删除，不进入回收站！请输入完整文件名确认。</p>
-                <input v-model="deleteName" :disabled="busy" :placeholder="selected.name" />
-              </template>
-              <button :class="plan.permanent ? 'destructive' : 'primary'" :disabled="busy || (plan.permanent && deleteName !== selected.name)" @click="execute">{{ plan.permanent ? "确认永久删除" : plannedRequest?.action === "move" ? "确认移动" : "确认重命名" }}</button>
+              <button class="primary" :disabled="busy" @click="execute">{{ plannedRequest?.action === "move" ? "确认移动" : "确认重命名" }}</button>
             </div>
           </div>
         </template>
+        <dialog ref="fileDeleteDialog" class="folder-picker" aria-labelledby="file-delete-title" @cancel="busy && $event.preventDefault()">
+          <h2 id="file-delete-title">永久删除 {{ fileDeletePreview?.files.length ?? 0 }} 个文件</h2>
+          <div class="folder-picker-body">
+            <p class="danger">不会进入回收站，无法撤销。请核对以下文件：</p>
+            <ul class="delete-file-list"><li v-for="file in fileDeletePreview?.files" :key="file.source"><code>{{ file.source }}</code> · {{ (file.size / 1024 / 1024).toFixed(2) }} MB</li></ul>
+            <p v-if="fileDeleteError" class="message error" role="alert">{{ fileDeleteError }}</p>
+          </div>
+          <div class="config-actions">
+            <button :disabled="busy" @click="fileDeleteDialog?.close(); fileDeleteRequest = null">{{ fileDeleteError ? "关闭并核对" : "取消" }}</button>
+            <button class="destructive" :disabled="busy || !fileDeleteRequest" @click="deleteFiles">确认永久删除</button>
+          </div>
+        </dialog>
       </section>
       <section v-if="tab === 'renaming' || (tab === 'configuration' && isAdmin && configurationSection === 'renaming')" class="panel">
         <h2>{{ tab === "configuration" ? "命名规则" : "按集号整理文件名" }}</h2>
@@ -1326,33 +1468,51 @@ async function changePassword() {
           <details v-if="tab === 'configuration'" open>
             <summary>规则列表{{ renameRulesDirty ? " · 有未保存修改" : "" }}</summary>
             <div class="config-section-heading">
-              <p class="help-text">按从上到下的顺序匹配，首个有效规则生效。</p>
+              <p class="help-text">文件名固定为 01、02…，保留扩展名。新增、删除立即生效；编辑已有规则及排序仍需保存，至少保留一条规则。</p>
               <button :disabled="busy || renameRules.length >= 32" @click="addRenameRule">添加规则</button>
+            </div>
+            <div class="row-actions selection-actions">
+              <label class="check-control"><input type="checkbox" :checked="!!renameRules.length && selectedRuleIds.length === renameRules.length" :disabled="busy || !renameRules.length" @change="selectedRuleIds = selectedRuleIds.length === renameRules.length ? [] : renameRules.map(rule => rule.id)" /><span>全选规则</span></label>
+              <button class="danger-button" :disabled="busy || !selectedRuleIds.length || selectedRuleIds.length >= renameRules.length" @click="deleteRenameRules(selectedRuleIds)">批量删除（{{ selectedRuleIds.length }}）</button>
             </div>
             <div v-for="(rule, index) in renameRules" :key="rule.id" class="config-card">
               <div class="config-card-heading">
                 <div class="row-actions">
-                  <strong>规则 {{ index + 1 }}</strong>
+                  <label class="check-control"><input v-model="selectedRuleIds" type="checkbox" :value="rule.id" :disabled="busy" :aria-label="`选择规则 ${index + 1}`" /><strong>规则 {{ index + 1 }}</strong></label>
                   <label class="check-control"><input v-model="rule.enabled" type="checkbox" :disabled="busy" :aria-label="`启用规则 ${index + 1}`" /><span>启用</span></label>
                 </div>
                 <div class="row-actions">
                   <button :disabled="busy || index === 0" :aria-label="`上移规则 ${index + 1}`" @click="moveRenameRule(index, -1)">上移</button>
                   <button :disabled="busy || index === renameRules.length - 1" :aria-label="`下移规则 ${index + 1}`" @click="moveRenameRule(index, 1)">下移</button>
-                  <button class="danger-button config-delete" :disabled="busy || renameRules.length === 1" :aria-label="`删除规则 ${index + 1}`" @click="renameRules.splice(index, 1)">删除</button>
+                  <button class="danger-button config-delete" :disabled="busy || renameRules.length === 1" :aria-label="`删除规则 ${index + 1}`" @click="deleteRenameRules([rule.id])">删除</button>
                 </div>
               </div>
               <div class="config-fields">
                 <label class="config-field">规则名称<input v-model="rule.name" :disabled="busy" maxlength="80" /></label>
-                <label class="config-field config-field-short">目标名模板<input v-model="rule.template" class="code-input" :disabled="busy" maxlength="180" /><span class="help-text">示例：{episode:02d} → 01</span></label>
                 <label class="config-field config-field-wide">正则表达式<textarea v-model="rule.pattern" class="code-input" :disabled="busy" rows="3" maxlength="2000"></textarea><span class="help-text">使用命名捕获组 (?P&lt;episode&gt;...) 提取集号。</span></label>
               </div>
             </div>
             <div class="config-actions">
               <span class="help-text" role="status">{{ renameRulesDirty ? "有未保存的修改" : "规则修改后需保存生效" }}</span>
               <button :disabled="busy" @click="run(loadRenameRules)">重新加载</button>
-              <button class="primary" :disabled="busy" @click="saveRenameRules">保存规则</button>
+              <button class="primary" :disabled="busy || !renameRulesDirty" @click="saveRenameRules">保存编辑</button>
             </div>
           </details>
+          <dialog ref="newRuleDialog" class="folder-picker" aria-labelledby="new-rule-title" @cancel="busy && $event.preventDefault()">
+            <h2 id="new-rule-title">新增命名规则</h2>
+            <form class="dialog-form" @submit.prevent="createRenameRule">
+              <div class="folder-picker-body config-fields">
+                <label class="config-field">规则名称<input v-model="newRule.name" required maxlength="80" :disabled="busy" /></label>
+                <label class="config-field config-field-wide">正则表达式<textarea v-model="newRule.pattern" class="code-input" required rows="3" maxlength="2000" :disabled="busy"></textarea><span class="help-text">使用 (?P&lt;episode&gt;...) 提取集号。文件名固定为 01、02…，保留扩展名。</span></label>
+                <label class="check-control"><input v-model="newRule.enabled" type="checkbox" :disabled="busy" /><span>启用</span></label>
+                <p v-if="error" class="message error config-field-wide" role="alert">{{ error }}</p>
+              </div>
+              <div class="config-actions">
+                <button type="button" :disabled="busy" @click="newRuleDialog?.close()">取消</button>
+                <button class="primary" :disabled="busy">新增并生效</button>
+              </div>
+            </form>
+          </dialog>
           <template v-if="tab === 'renaming'">
           <p v-if="!config.roots.length" class="message">请先在“配置管理”中添加媒体目录。<a href="#configuration">前往配置管理</a></p>
           <p v-if="renameRulesDirty" class="warning">命名规则有未保存的修改，请先到<a href="#configuration/renaming">命名规则</a>保存。</p>
@@ -1430,7 +1590,7 @@ async function changePassword() {
         <p v-if="videoInfoStatus?.error" class="message error">{{ videoInfoStatus.error }}</p>
         <p v-if="videoStatusError" class="message error">{{ videoStatusError }}</p>
         <p v-if="videoInfoStatus?.finished_at" class="scan-summary">最近扫描 {{ new Date(videoInfoStatus.finished_at).toLocaleString() }} · 已识别 {{ videoInfoStatus.summary.analyzed ?? 0 }} / 缓存 {{ videoInfoStatus.summary.cached ?? 0 }} / 暂缓 {{ videoInfoStatus.summary.deferred ?? 0 }} / 失败 {{ videoInfoStatus.summary.failed ?? 0 }}</p>
-        <div class="toolbar">
+        <div class="toolbar video-info-toolbar">
           <label class="directory-field">媒体目录<select v-model.number="videoInfoRoot" :disabled="busy || videoInfoLoading" aria-label="视频参数媒体目录">
             <option :value="-1" disabled>请选择媒体目录</option>
             <option v-for="item in config.roots" :key="item.id" :value="item.id" :title="item.path">{{ rootLabel(item.path) }}</option>
@@ -1643,12 +1803,12 @@ async function changePassword() {
                   </div>
                 </div>
                 <label class="config-field">API Key / Read Access Token
-                  <input v-model="scraper.api_key" type="password" autocomplete="off" maxlength="2048" :disabled="busy || scraper.clear_api_key" :aria-label="`${scraper.name} Key`" />
+                  <input v-model="scraper.api_key" type="password" autocomplete="off" maxlength="2048" :disabled="busy" :aria-label="`${scraper.name} Key`" />
                   <span class="help-text">{{ scraper.configured ? "已保存的 Key 不回显；留空保留现值，输入新 Key 后保存以替换。" : "填写 Key 后点击下方“保存配置”。" }}{{ scraper.key_source === "environment" ? " 当前来源：环境变量。" : "" }}</span>
                 </label>
                 <div class="config-sensitive-action">
-                  <label class="check-control check-danger"><input v-model="scraper.clear_api_key" type="checkbox" :disabled="busy" /><span>清除 {{ scraper.name }} Key</span></label>
-                  <span class="help-text">勾选并保存后清除。</span>
+                  <button type="button" class="danger-button" :disabled="busy || !scraper.configured" @click="clearScraperKey(scraper)">清除 {{ scraper.name }} Key</button>
+                  <span class="help-text">确认后立即清除，无需再次保存。</span>
                 </div>
               </div>
               <div class="config-actions">
@@ -1667,7 +1827,7 @@ async function changePassword() {
               <label class="config-field">剧名 / 电影名<input v-model="metadataSearchName" maxlength="255" required :disabled="busy" aria-label="TMDB 搜索名称" @input="metadataSearchIsFolder = false" /></label>
               <button :disabled="busy || !metadataSearchName.trim()">搜索影视</button>
             </form>
-            <p v-if="metadataTarget" class="help-text">当前待关联文件夹：<code>{{ metadataTarget.path || metadataTarget.name }}</code>。选择候选后，在下方确认并保存关联。</p>
+            <p v-if="metadataTarget" class="help-text">当前待关联文件夹：<code>{{ metadataTarget.path || metadataTarget.name }}</code>。点击候选的“关联此影视”后立即生效。</p>
             <p v-else class="warning">尚未选择目标文件夹；可以搜索，但保存关联前必须先选择媒体目录。</p>
             <template v-if="metadataSearchReport">
               <p v-for="warning in metadataSearchReport.warnings" :key="warning" class="warning">{{ warning }}</p>
@@ -1678,7 +1838,7 @@ async function changePassword() {
                   <td>{{ candidate.name || candidate.title }}<p>{{ candidate.original_name || candidate.original_title }}</p></td>
                   <td>{{ candidate.first_air_date || candidate.release_date || "未知" }}</td>
                   <td><details><summary>{{ candidate.overview ? "查看简介" : "暂无简介" }}</summary><p>{{ candidate.overview }}</p></details></td>
-                  <td><button :disabled="busy" @click="chooseMetadataCandidate(candidate)">使用此 ID</button></td>
+                  <td><button :disabled="busy || !metadataTarget || candidate.scraper_id !== 'tmdb'" @click="chooseMetadataCandidate(candidate)">关联此影视</button></td>
                 </tr><tr v-if="!metadataSearchReport.results.length"><td colspan="5">没有找到候选，可尝试原名或其他译名。</td></tr>
               </tbody></table></div>
               <div class="toolbar">
@@ -1689,12 +1849,12 @@ async function changePassword() {
             </template>
           </div>
           <details ref="metadataMappingPanel" class="config-card" open>
-            <summary>确认影视关联</summary>
+            <summary>手动填写 / 修改影视关联</summary>
             <p class="help-text">当前目标：<code>{{ metadataTarget ? metadataTarget.path || metadataTarget.name : "尚未选择，请先选择媒体目录" }}</code></p>
             <form @submit.prevent="saveMetadataMapping(metadataTarget?.path, metadataMappingId)">
               <label class="config-field config-field-short">TMDB ID
                 <input v-model.number="metadataMappingId" type="number" min="1" max="2147483647" step="1" required :disabled="busy" aria-label="映射 TMDB ID" />
-                <span class="help-text">从搜索结果选择，或直接输入已知 ID。</span>
+                <span class="help-text">直接输入已知 ID；搜索结果可直接点击关联，无需在此再次保存。</span>
               </label>
               <div class="config-actions">
                 <span class="help-text">核对目标文件夹与 ID；保存后需重新预览刮削。</span>
@@ -1706,11 +1866,16 @@ async function changePassword() {
             <h3>已保存的关联（{{ currentMetadataMappings.length }} 条）</h3>
             <button :disabled="busy" @click="run(loadMetadataMappings)">刷新列表</button>
           </div>
-          <div class="table-wrap"><table><thead><tr><th>媒体根目录 / 文件夹</th><th>TMDB ID</th><th>操作</th></tr></thead><tbody>
+          <div class="row-actions selection-actions">
+            <label class="check-control"><input type="checkbox" :checked="!!currentMetadataMappings.length && currentMetadataMappings.slice(0, 1000).every(item => selectedMappingIds.includes(item.id))" :disabled="busy || !currentMetadataMappings.length" @change="selectedMappingIds = currentMetadataMappings.slice(0, 1000).every(item => selectedMappingIds.includes(item.id)) ? [] : currentMetadataMappings.slice(0, 1000).map(item => item.id)" /><span>{{ currentMetadataMappings.length > 1000 ? "选择前 1000 条关联" : "全选关联" }}</span></label>
+            <button class="danger-button" :disabled="busy || !selectedMappingIds.length" @click="deleteMetadataMappings(selectedMappingIds)">批量解除关联（{{ selectedMappingIds.length }}）</button>
+          </div>
+          <div class="table-wrap"><table><thead><tr><th class="selection-cell">选择</th><th>媒体根目录 / 文件夹</th><th>TMDB ID</th><th>操作</th></tr></thead><tbody>
             <tr v-for="mapping in currentMetadataMappings" :key="mapping.id">
+              <td class="selection-cell"><input v-model="selectedMappingIds" type="checkbox" :value="mapping.id" :disabled="busy || (selectedMappingIds.length >= 1000 && !selectedMappingIds.includes(mapping.id))" :aria-label="`选择关联 ${mapping.folder_name}`" /></td>
               <td>{{ mapping.root_path }}<p>{{ mapping.folder_path }}</p></td><td>{{ mapping.tmdb_id }}</td>
-              <td><div class="row-actions"><button :disabled="busy" @click="editMetadataMapping(mapping)">编辑</button><button class="danger-button" :disabled="busy" @click="deleteMetadataMapping(mapping)">解除关联</button></div></td>
-            </tr><tr v-if="!currentMetadataMappings.length"><td colspan="3">暂无手动关联，可选择文件夹后搜索并指定 ID。</td></tr>
+              <td><div class="row-actions"><button :disabled="busy" @click="editMetadataMapping(mapping)">编辑</button><button class="danger-button" :disabled="busy" @click="deleteMetadataMappings([mapping.id])">解除关联</button></div></td>
+            </tr><tr v-if="!currentMetadataMappings.length"><td colspan="4">暂无手动关联，可选择文件夹后搜索并指定 ID。</td></tr>
           </tbody></table></div>
           <details class="help-details"><summary>检查与清理失效关联</summary>
             <p class="help-text">仅清理关联记录，不删除媒体文件。</p>

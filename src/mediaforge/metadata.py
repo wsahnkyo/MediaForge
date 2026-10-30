@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from hashlib import sha256
 from pathlib import Path
 from threading import Lock
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from uuid import uuid4
 
 import httpx
@@ -28,6 +28,7 @@ from mediaforge.scrapers import (
     ScraperDefinition,
     ScraperService,
     ScraperSettingsUpdate,
+    ScraperUpdate,
     fill_missing,
 )
 
@@ -87,6 +88,12 @@ class MetadataMappingInput(BaseModel):
 class MetadataCleanup(BaseModel):
     dry_run: bool = True
     api_key: SecretStr | None = Field(default=None, exclude=True)
+
+
+class MetadataMappingsDelete(BaseModel):
+    ids: list[Annotated[str, Field(min_length=1, max_length=36)]] = Field(
+        min_length=1, max_length=1000
+    )
 
 
 class TMDBHTTPError(ValueError):
@@ -356,6 +363,25 @@ class MetadataService:
             self.previews.clear()
             return result
 
+    def clear_scraper_key(self, scraper_id: str) -> dict[str, Any]:
+        with self.files.lock:
+            self.scrapers.definition(scraper_id)
+            config = next(
+                item for item in self.scrapers.configurations() if item["id"] == scraper_id
+            )
+            return self.save_scrapers(
+                ScraperSettingsUpdate(
+                    scrapers=[
+                        ScraperUpdate(
+                            id=scraper_id,
+                            enabled=config["enabled"],
+                            priority=config["priority"],
+                            clear_api_key=True,
+                        )
+                    ]
+                )
+            )
+
     @contextmanager
     def _clients(self, selected: list[str], key: SecretStr | None, language: str):
         with ExitStack() as stack:
@@ -496,21 +522,38 @@ class MetadataService:
             self.files.check_roots_version(request.roots_version)
             return self.store.execute("metadata.mapping.save", request.model_dump(), apply)
 
-    def delete_mapping(self, mapping_id: str) -> dict[str, Any]:
-        def apply() -> dict[str, Any]:
-            with self.store.sessions() as session:
-                mapping = session.get(MetadataMapping, mapping_id)
-                if mapping is None:
-                    raise ValueError("手动映射不存在，请刷新列表")
-                result = self._mapping_data(mapping)
-                location_key = mapping.location_key
+    def _delete_mappings(self, ids: list[str]) -> list[dict[str, Any]]:
+        if len(set(ids)) != len(ids):
+            raise ValueError("不能重复选择同一条关联")
+        with self.store.sessions() as session:
+            mappings = list(
+                session.scalars(select(MetadataMapping).where(MetadataMapping.id.in_(ids)))
+            )
+            if len(mappings) != len(ids):
+                raise ValueError("手动映射不存在，请刷新列表")
+            results = [self._mapping_data(mapping) for mapping in mappings]
+            for mapping in mappings:
                 session.delete(mapping)
-                session.commit()
-            self._invalidate_mapping(result["media_type"], location_key)
-            return result
+            session.commit()
+            for mapping in mappings:
+                self._invalidate_mapping(mapping.media_type, mapping.location_key)
+            return results
+
+    def delete_mapping(self, mapping_id: str) -> dict[str, Any]:
+        with self.files.lock:
+            return self.store.execute(
+                "metadata.mapping.delete",
+                {"id": mapping_id},
+                lambda: self._delete_mappings([mapping_id])[0],
+            )
+
+    def delete_mappings(self, request: MetadataMappingsDelete) -> dict[str, Any]:
+        def apply() -> dict[str, Any]:
+            results = self._delete_mappings(request.ids)
+            return {"mappings": results, "deleted_count": len(results)}
 
         with self.files.lock:
-            return self.store.execute("metadata.mapping.delete", {"id": mapping_id}, apply)
+            return self.store.execute("metadata.mapping.delete_batch", request.model_dump(), apply)
 
     def cleanup_mappings(self, request: MetadataCleanup) -> dict[str, Any]:
         with self.lock:

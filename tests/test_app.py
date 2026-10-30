@@ -16,6 +16,86 @@ from mediaforge.video_info import VideoInfoService
 HEADERS = {"X-MediaForge-Request": "1"}
 
 
+def test_immediate_mutation_routes_require_admin_and_same_origin_header(client):
+    routes = [
+        (
+            "POST",
+            "/api/files/delete-batch",
+            {"root": 0, "paths": ["movie.mkv"], "roots_version": "old"},
+        ),
+        ("POST", "/api/renaming/rules", {"name": "New", "pattern": r"(?P<episode>\d+)"}),
+        ("POST", "/api/renaming/rules/delete", {"ids": ["example"]}),
+        ("POST", "/api/metadata/mappings/delete", {"ids": ["example"]}),
+        ("DELETE", "/api/metadata/scrapers/tmdb/key", None),
+    ]
+    for method, path, body in routes:
+        assert client.request(method, path, json=body, headers=HEADERS).status_code == 401
+    assert login(client, "viewer", "viewer-password-123").status_code == 200
+    for method, path, body in routes:
+        assert client.request(method, path, json=body, headers=HEADERS).status_code == 403
+    assert login(client).status_code == 200
+    for method, path, body in routes:
+        assert client.request(method, path, json=body).status_code == 403
+
+
+def test_immediate_crud_routes_persist_changes_and_preserve_legacy_endpoints(client):
+    assert login(client).status_code == 200
+    root = client.app.state.files.roots[0]
+    root.mkdir()
+    (root / "movie.mkv").write_bytes(b"movie")
+    (root / "second.mkv").write_bytes(b"second")
+    version = client.get("/api/config").json()["roots_version"]
+    body = {"root": 0, "paths": ["movie.mkv", "second.mkv"], "roots_version": version}
+    preview = client.post("/api/files/delete-batch", json=body, headers=HEADERS)
+    assert preview.status_code == 200
+    response = client.post(
+        "/api/files/delete-batch",
+        headers=HEADERS,
+        json={
+            **body,
+            "dry_run": False,
+            "preview_id": preview.json()["preview_id"],
+        },
+    )
+    assert response.status_code == 200 and response.json()["deleted_count"] == 2
+    rules = client.get("/api/renaming/rules").json()
+    response = client.post(
+        "/api/renaming/rules",
+        headers=HEADERS,
+        json={
+            "id": "new-rule",
+            "name": "New rule",
+            "pattern": r"(?P<episode>\d+)",
+        },
+    )
+    assert response.status_code == 200 and len(response.json()["rules"]) == len(rules) + 1
+    response = client.post(
+        "/api/renaming/rules/delete", headers=HEADERS, json={"ids": ["new-rule"]}
+    )
+    assert response.status_code == 200
+    assert client.get("/api/renaming/rules").json() == rules
+    mapping = client.post(
+        "/api/metadata/mappings",
+        headers=HEADERS,
+        json={
+            "root": 0,
+            "path": "",
+            "tmdb_id": 42,
+            "media_type": "tv",
+            "roots_version": version,
+        },
+    )
+    assert mapping.status_code == 200
+    response = client.post(
+        "/api/metadata/mappings/delete", headers=HEADERS, json={"ids": [mapping.json()["id"]]}
+    )
+    assert response.status_code == 200 and response.json()["deleted_count"] == 1
+    assert client.get("/api/metadata/mappings").json() == []
+    assert client.delete("/api/metadata/scrapers/tmdb/key", headers=HEADERS).status_code == 200
+    assert client.get("/api/metadata/scrapers").json()[0]["configured"] is False
+    assert client.get("/api/renaming/rules").status_code == 200
+
+
 def test_operation_summaries_and_authenticated_detail(client):
     result = client.app.state.store.execute(
         "test.detail", {"input": "example"}, lambda: {"rows": ["detail"]}
@@ -50,7 +130,7 @@ def test_regex_rename_api_preview_edit_confirmation_and_unchanged_directory(clie
     )
     root = client.app.state.files.roots[0]
     root.mkdir()
-    (root / "Example.01.mkv").write_bytes(b"video")
+    (root / "Example.EP01.mkv").write_bytes(b"video")
     (root / "child").mkdir()
     (root / "child" / "02.mkv").write_bytes(b"child")
     assert (
@@ -61,13 +141,13 @@ def test_regex_rename_api_preview_edit_confirmation_and_unchanged_directory(clie
     )
     preview = client.post("/api/renaming/preview", json={"root": 0}, headers=HEADERS).json()
     assert preview["ready_count"] == 1
-    assert (root / "Example.01.mkv").exists()
+    assert (root / "Example.EP01.mkv").exists()
     revised = client.post(
         "/api/renaming/review",
         headers=HEADERS,
         json={
             "preview_id": preview["preview_id"],
-            "edits": [{"source": "Example.01.mkv", "new_name": "03.mkv"}],
+            "edits": [{"source": "Example.EP01.mkv", "new_name": "03.mkv"}],
         },
     ).json()
     result = client.post(
@@ -89,8 +169,8 @@ def test_multiple_media_roots_rename_only_selected_directory(client, tmp_path):
     first, second = tmp_path / "first-library", tmp_path / "second-library"
     first.mkdir()
     second.mkdir()
-    (first / "Example.01.mkv").write_bytes(b"first")
-    (second / "Example.02.mkv").write_bytes(b"second")
+    (first / "Example.EP01.mkv").write_bytes(b"first")
+    (second / "Example.EP02.mkv").write_bytes(b"second")
     response = client.put(
         "/api/config/media-roots", json={"roots": [str(first), str(second)]}, headers=HEADERS
     )
@@ -102,15 +182,15 @@ def test_multiple_media_roots_rename_only_selected_directory(client, tmp_path):
         json={"root": 1, "roots_version": config["roots_version"]},
         headers=HEADERS,
     ).json()
-    assert [row["name"] for row in preview["rows"]] == ["Example.02.mkv"]
+    assert [row["name"] for row in preview["rows"]] == ["Example.EP02.mkv"]
     assert preview["rows"][0]["new_name"] == "02.mkv"
-    assert (second / "Example.02.mkv").exists()
+    assert (second / "Example.EP02.mkv").exists()
     result = client.post(
         "/api/renaming/apply", json={"preview_id": preview["preview_id"]}, headers=HEADERS
     )
     assert result.status_code == 200
     assert (second / "02.mkv").read_bytes() == b"second"
-    assert (first / "Example.01.mkv").read_bytes() == b"first"
+    assert (first / "Example.EP01.mkv").read_bytes() == b"first"
     assert (
         client.post("/api/renaming/preview", json={"root": 0}, headers=HEADERS).json()[
             "ready_count"

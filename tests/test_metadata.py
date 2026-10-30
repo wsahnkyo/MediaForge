@@ -16,6 +16,7 @@ from mediaforge.metadata import (
     MetadataApply,
     MetadataCleanup,
     MetadataMappingInput,
+    MetadataMappingsDelete,
     MetadataPreview,
     MetadataSearch,
     MetadataService,
@@ -584,6 +585,35 @@ def test_mapping_update_delete_and_media_type_isolation(metadata):
     assert any("/search/tv" in request.url.path for request in metadata.calls)
     with pytest.raises(ValueError, match="不存在"):
         metadata.delete_mapping(updated["id"])
+
+
+def test_batch_mapping_deletion_is_atomic_and_invalidates_only_affected_previews(metadata):
+    ids = [
+        metadata.save_mapping(
+            MetadataMappingInput(
+                media_type=media_type,
+                root=0,
+                path="示例剧 (2020)",
+                tmdb_id=42,
+            )
+        )["id"]
+        for media_type in ("tv", "movie")
+    ]
+    before = metadata.mappings()
+    for invalid in ([ids[0], "missing"], [ids[0], ids[0]]):
+        with pytest.raises(ValueError):
+            metadata.delete_mappings(MetadataMappingsDelete(ids=invalid))
+        assert metadata.mappings() == before
+    tv = metadata.preview(MetadataPreview(root=0, path="示例剧 (2020)"))
+    movie = metadata.preview(MetadataPreview(root=0, path="示例剧 (2020)", media_type="movie"))
+    result = metadata.delete_mappings(MetadataMappingsDelete(ids=ids))
+    assert result["deleted_count"] == 2
+    assert metadata.mappings() == []
+    assert tv["preview_id"] not in metadata.previews
+    assert movie["preview_id"] not in metadata.previews
+    assert (metadata.files.roots[0] / "示例剧 (2020)" / "02.mp4").exists()
+    with pytest.raises(ValueError, match="不存在"):
+        metadata.delete_mappings(MetadataMappingsDelete(ids=ids))
 
 
 def test_invalid_manual_id_fails_explicitly_without_automatic_fallback(metadata, monkeypatch):
